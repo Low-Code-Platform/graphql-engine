@@ -915,6 +915,7 @@ library
                      , Hasura.RQL.DDL.Schema.Cache.Config
                      , Hasura.RQL.DDL.Schema.Cache.Dependencies
                      , Hasura.RQL.DDL.Schema.Cache.Fields
+                     , Hasura.RQL.DDL.Schema.Cache.PartialRebuild
                      , Hasura.RQL.DDL.Schema.Cache.Permission
                      , Hasura.RQL.DDL.Schema.Catalog
                      , Hasura.RQL.DDL.Schema.Diff

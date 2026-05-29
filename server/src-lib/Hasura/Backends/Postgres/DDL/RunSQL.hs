@@ -47,6 +47,7 @@ import Hasura.EncJSON
 import Hasura.Function.Cache
 import Hasura.Prelude
 import Hasura.RQL.DDL.Schema
+import Hasura.RQL.DDL.Schema.Cache.PartialRebuild (buildSchemaCacheForDbSchema)
 import Hasura.RQL.DDL.Schema.Diff qualified as Diff
 import Hasura.RQL.Types.Backend
 import Hasura.RQL.Types.BackendType
@@ -69,6 +70,7 @@ import Text.Regex.TDFA qualified as TDFA
 data RunSQL = RunSQL
   { rSql :: Text,
     rSource :: SourceName,
+    rSchema :: Maybe SchemaName,
     rCascade :: Bool,
     rCheckMetadataConsistency :: Maybe Bool,
     rTxAccessMode :: PG.TxAccess,
@@ -80,6 +82,7 @@ instance FromJSON RunSQL where
   parseJSON = withObject "RunSQL" $ \o -> do
     rSql <- o .: "sql"
     rSource <- o .:? "source" .!= defaultSource
+    rSchema <- o .:? "schema"
     rCascade <- o .:? "cascade" .!= False
     rCheckMetadataConsistency <- o .:? "check_metadata_consistency"
     readOnly <- o .:? "read_only" .!= False
@@ -92,6 +95,7 @@ instance ToJSON RunSQL where
     object
       [ "sql" .= rSql,
         "source" .= rSource,
+        "schema" .= rSchema,
         "cascade" .= rCascade,
         "check_metadata_consistency" .= rCheckMetadataConsistency,
         "read_only"
@@ -229,7 +233,7 @@ runRunSQL sqlGen q@RunSQL {..} = do
   if (isSchemaCacheBuildRequiredRunSQL q)
     then do
       -- see Note [Checking metadata consistency in run_sql]
-      withMetadataCheck @pgKind sqlGen rSource rCascade pgExecTxType
+      withMetadataCheck @pgKind sqlGen rSource rSchema rCascade pgExecTxType
         $ withTraceContext traceCtx
         $ withUserInfo userInfo
         $ execSQL rSql
@@ -352,11 +356,12 @@ withMetadataCheck ::
   ) =>
   SQLGenCtx ->
   SourceName ->
+  Maybe SchemaName ->
   Bool ->
   PGExecTxType ->
   PG.TxET QErr m a ->
   m a
-withMetadataCheck sqlGen source cascade txType runSQLQuery = do
+withMetadataCheck sqlGen source mSchema cascade txType runSQLQuery = do
   SourceInfo {..} <- askSourceInfo @('Postgres pgKind) source
 
   -- Run SQL query and metadata checker in a transaction
@@ -364,7 +369,9 @@ withMetadataCheck sqlGen source cascade txType runSQLQuery = do
 
   -- Build schema cache with updated metadata
   withNewInconsistentObjsCheck
-    $ buildSchemaCacheWithInvalidations mempty {ciSources = HS.singleton source} metadataUpdater
+    $ case mSchema of
+        Just schema -> buildSchemaCacheForDbSchema source schema metadataUpdater
+        Nothing -> buildSchemaCacheWithInvalidations mempty {ciSources = HS.singleton source} metadataUpdater
 
   postRunSQLSchemaCache <- askSchemaCache
 

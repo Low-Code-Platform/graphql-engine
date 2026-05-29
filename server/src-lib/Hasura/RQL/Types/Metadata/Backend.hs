@@ -30,6 +30,7 @@ import Hasura.RQL.Types.Relationships.Local
 import Hasura.RQL.Types.SchemaCache
 import Hasura.RQL.Types.SchemaCache.Build
 import Hasura.RQL.Types.Source
+import Hasura.Backends.Postgres.SQL.Types (SchemaName, publicSchema)
 import Hasura.RQL.Types.Source.Table (SourceTableInfo)
 import Hasura.SQL.Types
 import Hasura.Server.Init.FeatureFlag qualified as FF
@@ -272,3 +273,13 @@ class
   -- | Allows the backend to control whether or not a particular source supports being
   -- the target of remote relationships or not
   supportsBeingRemoteRelationshipTarget :: SourceConfig b -> Bool
+
+  -- | Extract the DB schema name from a table name.
+  -- For Postgres this is 'qSchema'; single-schema backends return 'publicSchema'.
+  tableNameSchema :: TableName b -> SchemaName
+  tableNameSchema _ = publicSchema
+
+  -- | Extract the DB schema name from a function name.
+  -- For Postgres this is 'qSchema'; single-schema backends return 'publicSchema'.
+  functionNameSchema :: FunctionName b -> SchemaName
+  functionNameSchema _ = publicSchema

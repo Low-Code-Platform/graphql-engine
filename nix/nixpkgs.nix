@@ -8,6 +8,11 @@ import nixpkgs {
     permittedInsecurePackages = [
       "nodejs-16.20.2" # until we upgrade our node.js version in .nvmrc
     ];
+    problems.handlers = {
+      apply-refact = {
+        broken = "warn";
+      };
+    };
   };
   overlays = [
     (import ./overlays/ghc.nix { inherit nixpkgs; })

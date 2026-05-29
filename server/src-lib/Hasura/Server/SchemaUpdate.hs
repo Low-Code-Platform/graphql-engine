@@ -353,7 +353,8 @@ refreshSchemaCache
                                 ciDataConnectors =
                                   maybe mempty (HS.fromList . HashMap.keys . unBackendInfoWrapper)
                                     $ BackendMap.lookup @'DataConnector
-                                    $ scBackendCache schemaCache
+                                    $ scBackendCache schemaCache,
+                                ciSourceSchemas = mempty
                               }
                   buildSchemaCacheWithOptions CatalogSync cacheInvalidations metadata (Just latestResourceVersion)
                   setMetadataResourceVersionInSchemaCache latestResourceVersion

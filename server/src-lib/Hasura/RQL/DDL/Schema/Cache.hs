@@ -78,6 +78,8 @@ import Hasura.RQL.DDL.Schema.Cache.Common
 import Hasura.RQL.DDL.Schema.Cache.Config
 import Hasura.RQL.DDL.Schema.Cache.Dependencies
 import Hasura.RQL.DDL.Schema.Cache.Fields
+import Hasura.Backends.Postgres.SQL.Types (SchemaName)
+import Hasura.RQL.DDL.Schema.Cache.PartialRebuild (partitionIntrospectionBySchema)
 import Hasura.RQL.DDL.Schema.Cache.Permission
 import Hasura.RQL.DDL.SchemaRegistry
 import Hasura.RQL.Types.Action
@@ -802,6 +804,61 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
           returnA -< (RETDoNothing, SCMSUninitializedSource)
         Just (recreateEventTriggers, catalogMigrationState) -> returnA -< (recreateEventTriggers, catalogMigrationState)
 
+    -- Per-schema wrapper around 'buildTableCache'.
+    --
+    -- 'Inc.cache'-wraps the call so that each schema's table-cache is memoised
+    -- independently.  The schema-specific 'Inc.Dependency' (drawn from
+    -- '_ikSourceSchemas') is opened inside the block so that only the targeted
+    -- schema's entry is invalidated when 'ciSourceSchemas' fires; all other
+    -- schemas are served from cache.
+    buildTableCacheForSchema ::
+      forall b arr m.
+      ( ArrowChoice arr,
+        Inc.ArrowDistribute arr,
+        ArrowWriter (Seq CollectItem) arr,
+        Inc.ArrowCache m arr,
+        MonadIO m,
+        MonadBaseControl IO m,
+        BackendMetadata b
+      ) =>
+      ( SourceName,
+        SourceConfig b,
+        SchemaName,
+        DBObjectsIntrospection b,
+        [TableBuildInput b],
+        Inc.Dependency (Maybe Inc.InvalidationKey),
+        Inc.Dependency Inc.InvalidationKey,
+        NamingCase,
+        LogicalModels b
+      )
+        `arr` HashMap (TableName b) (TableCoreInfoG b (StructuredColumnInfo b) (ColumnInfo b))
+    buildTableCacheForSchema = Inc.cache proc
+      ( sourceName,
+        sourceConfig,
+        _schemaName,
+        schemaIntrospection,
+        schemaTableInputs,
+        schemaKeyDep,
+        metadataKey,
+        namingConv,
+        logicalModels
+        ) -> do
+      metadataKeyValue <- Inc.dependOn -< metadataKey
+      schemaKeyValue <- Inc.dependOn -< schemaKeyDep
+      -- Use the per-schema key when available; fall back to the metadata key so
+      -- that a full metadata reload still propagates to buildTableCache.
+      let effectiveKey = fromMaybe metadataKeyValue schemaKeyValue
+      effectiveKeyDep <- Inc.newDependency -< effectiveKey
+      buildTableCache
+        -< ( sourceName,
+             sourceConfig,
+             _rsTables schemaIntrospection,
+             schemaTableInputs,
+             effectiveKeyDep,
+             namingConv,
+             logicalModels
+           )
+
     buildSource ::
       forall b arr m.
       ( ArrowChoice arr,
@@ -1266,17 +1323,34 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
                               (tableInputs, _, _) = unzip3 $ map mkTableInputs $ InsOrdHashMap.elems $ _smTables sourceMetadata
                               scNamingConvention = _scNamingConvention $ _smCustomization sourceMetadata
                               !namingConv = if isNamingConventionEnabled then fromMaybe defaultNC scNamingConvention else HasuraCase
-                          tablesCoreInfo <-
-                            buildTableCache
-                              -<
-                                ( sourceName,
-                                  sourceConfig,
-                                  _rsTables source,
-                                  tableInputs,
-                                  metadataInvalidationKey,
-                                  namingConv,
-                                  _smLogicalModels sourceMetadata
+                              -- Partition introspection and table inputs by schema so that
+                              -- buildTableCacheForSchema can be cached per schema.
+                              schemaMap = partitionIntrospectionBySchema @b source
+                              sourceSchemaKeysDep = Inc.selectD #_ikSourceSchemas invalidationKeys
+                              tableInputsBySchema =
+                                HashMap.fromListWith (<>)
+                                  [ (tableNameSchema @b (_tbiName tbi), [tbi])
+                                  | tbi <- tableInputs
+                                  ]
+                          perSchemaCoreInfoMaps <-
+                            (|
+                              Inc.keyed
+                                ( \schemaName schemaIntrospection ->
+                                    buildTableCacheForSchema
+                                      -< ( sourceName,
+                                           sourceConfig,
+                                           schemaName,
+                                           schemaIntrospection,
+                                           fromMaybe [] (HashMap.lookup schemaName tableInputsBySchema),
+                                           Inc.selectKeyD (sourceName, schemaName) sourceSchemaKeysDep,
+                                           metadataInvalidationKey,
+                                           namingConv,
+                                           _smLogicalModels sourceMetadata
+                                         )
                                 )
+                              |)
+                              schemaMap
+                          let tablesCoreInfo = HashMap.unions $ HashMap.elems perSchemaCoreInfoMaps
 
                           let tablesMetadata = InsOrdHashMap.elems $ _smTables sourceMetadata
                               eventTriggers = map (_tmTable &&& InsOrdHashMap.elems . _tmEventTriggers) tablesMetadata
