@@ -277,9 +277,9 @@ remote schema joins reference cross-source types.
   wrong result or an inconsistency error.
 
 **Benchmark**:
-- Fixture: 1 source, 5 schemas × 50 tables = 250 tables total.
+- Fixture: 1 source, 5 schemas × 200 tables = 1000 tables total.
 - Measure `p50`/`p99` latency of `run_sql` DDL before and after.
-- Target: latency proportional to 1 schema (50 tables), not all 5 (250 tables).
+- Target: latency proportional to 1 schema (200 tables), not all 5 (1000 tables).
 
 ---
 

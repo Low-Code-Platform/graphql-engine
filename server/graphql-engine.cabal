@@ -1314,3 +1314,21 @@ test-suite graphql-engine-test-postgres
     Test.Hasura.EventTriggerCleanupSuite
     Test.Hasura.StreamingSubscriptionSuite
     Test.Hasura.Server.MigrateSuite
+
+benchmark schema-cache-bench
+  type:             exitcode-stdio-1.0
+  hs-source-dirs:   bench
+  main-is:          SchemaCacheRebench.hs
+  default-language: Haskell2010
+  default-extensions:
+    ImportQualifiedPost
+    OverloadedStrings
+    RecordWildCards
+  ghc-options:      -Wall -O2 -threaded -rtsopts "-with-rtsopts=-N"
+  build-depends:
+      base        >= 4.14
+    , aeson
+    , bytestring
+    , http-client >= 0.7
+    , http-types
+    , tasty-bench >= 0.3
