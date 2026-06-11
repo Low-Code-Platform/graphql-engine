@@ -4,6 +4,11 @@
 
 module Hasura.GraphQL.Schema
   ( buildGQLContext,
+    buildSchemaOptions,
+    buildSchemaRoleParsers,
+    buildAllRoleParsersForSchema,
+    partitionSourceBySchema,
+    SchemaFieldParsers (..),
   )
 where
 
@@ -69,12 +74,39 @@ import Hasura.RQL.Types.Source
 import Hasura.RQL.Types.SourceCustomization as SC
 import Hasura.RemoteSchema.Metadata
 import Hasura.RemoteSchema.SchemaCache
+import Hasura.Backends.Postgres.SQL.Types (SchemaName)
+import Hasura.RQL.Types.Metadata.Backend (BackendMetadata, functionNameSchema, tableNameSchema)
 import Hasura.SQL.AnyBackend qualified as AB
 import Hasura.Server.Init.Logging
 import Hasura.Server.Types
 import Hasura.StoredProcedure.Cache (StoredProcedureCache, _spiReturns)
 import Hasura.Table.Cache
 import Language.GraphQL.Draft.Syntax qualified as G
+
+-------------------------------------------------------------------------------
+
+-- | Per-role field parsers produced for a single DB schema partition of a single source.
+-- Designed as a 'Monoid' so that per-schema results can be @mconcat@'d into a per-source
+-- result, and per-source results can be @mconcat@'d into the global merged parsers.
+data SchemaFieldParsers = SchemaFieldParsers
+  { _sfpQuery :: [FieldParser P.Parse (NamespacedField (QueryRootField UnpreparedValue))],
+    _sfpMutFrontend :: [FieldParser P.Parse (NamespacedField (MutationRootField UnpreparedValue))],
+    _sfpMutBackend :: [FieldParser P.Parse (NamespacedField (MutationRootField UnpreparedValue))],
+    _sfpSubscription :: [FieldParser P.Parse (NamespacedField (QueryRootField UnpreparedValue))],
+    _sfpApolloFed :: [(G.Name, Parser 'Output P.Parse (ApolloFederationParserFunction P.Parse))]
+  }
+
+instance Semigroup SchemaFieldParsers where
+  a <> b =
+    SchemaFieldParsers
+      (_sfpQuery a <> _sfpQuery b)
+      (_sfpMutFrontend a <> _sfpMutFrontend b)
+      (_sfpMutBackend a <> _sfpMutBackend b)
+      (_sfpSubscription a <> _sfpSubscription b)
+      (_sfpApolloFed a <> _sfpApolloFed b)
+
+instance Monoid SchemaFieldParsers where
+  mempty = SchemaFieldParsers [] [] [] [] []
 
 -------------------------------------------------------------------------------
 
@@ -115,6 +147,7 @@ buildGQLContext ::
   SQLGenCtx ->
   ApolloFederationStatus ->
   SourceCache ->
+  HashMap RoleName SchemaFieldParsers ->
   HashMap RemoteSchemaName (RemoteSchemaCtx, MetadataObject) ->
   ActionCache ->
   AnnotatedCustomTypes ->
@@ -141,6 +174,7 @@ buildGQLContext
   sqlGen
   apolloFederationStatus
   sources
+  mergedSourceParsers
   allRemoteSchemas
   allActions
   customTypes
@@ -152,13 +186,12 @@ buildGQLContext
             $ Set.fromList (allActionInfos ^.. folded . aiPermissions . to HashMap.keys . folded)
             <> Set.fromList (bool mempty remoteSchemasRoles $ remoteSchemaPermissions == Options.EnableRemoteSchemaPermissions)
         allActionInfos = HashMap.elems allActions
-        allTableRoles = Set.fromList $ getTableRoles =<< HashMap.elems sources
-        allLogicalModelRoles = Set.fromList $ getLogicalModelRoles =<< HashMap.elems sources
-        allRoles = actionRoles <> allTableRoles <> allLogicalModelRoles
+        -- All roles: from pre-computed source parsers plus action/remote-schema roles
+        allRoles = actionRoles <> HashMap.keysSet mergedSourceParsers
 
     contexts <-
-      -- Buld role contexts in parallel. We'd prefer deterministic parallelism
-      -- but that isn't really acheivable (see mono #3829). NOTE: the admin role
+      -- Build role contexts in parallel. We'd prefer deterministic parallelism
+      -- but that isn't really achievable (see mono #3829). NOTE: the admin role
       -- will still be a bottleneck here, even on huge_schema which has many
       -- roles.
       fmap HashMap.fromList
@@ -166,7 +199,7 @@ buildGQLContext
         $ \role -> do
           (role,)
             <$> concurrentlyEIO
-              ( buildRoleContext
+              ( assembleGQLContext
                   sampledFeatureFlags
                   (sqlGen, functionPermissions)
                   sources
@@ -178,6 +211,7 @@ buildGQLContext
                   experimentalFeatures
                   apolloFederationStatus
                   mSchemaRegistryContext
+                  (HashMap.findWithDefault mempty role mergedSourceParsers)
               )
               ( buildRelayRoleContext
                   (sqlGen, functionPermissions)
@@ -290,8 +324,10 @@ buildSchemaOptions
           removeEmptySubscriptionResponses
       }
 
--- | Build the @QueryHasura@ context for a given role.
-buildRoleContext ::
+-- | Assemble the per-role GQL context from pre-computed source parsers plus
+-- actions, remote schemas, and introspection.  Extracted from 'buildRoleContext'
+-- so the source-parser computation can be lifted out of the assembly loop.
+assembleGQLContext ::
   forall m.
   (MonadError QErr m, MonadIO m) =>
   SchemaSampledFeatureFlags ->
@@ -305,8 +341,9 @@ buildRoleContext ::
   Set.HashSet ExperimentalFeature ->
   ApolloFederationStatus ->
   Maybe SchemaRegistryContext ->
+  SchemaFieldParsers ->
   m RoleContextValue
-buildRoleContext sampledFeatureFlags options sources remotes actions customTypes role remoteSchemaPermsCtx expFeatures apolloFederationStatus mSchemaRegistryContext = do
+assembleGQLContext sampledFeatureFlags options sources remotes actions customTypes role remoteSchemaPermsCtx expFeatures apolloFederationStatus mSchemaRegistryContext sourceParsers = do
   let schemaOptions = buildSchemaOptions options expFeatures
       schemaContext =
         SchemaContext
@@ -321,13 +358,13 @@ buildRoleContext sampledFeatureFlags options sources remotes actions customTypes
           )
           role
           sampledFeatureFlags
+      -- Unpack the pre-computed source parsers
+      sourcesQueryFields = _sfpQuery sourceParsers
+      sourcesMutationFrontendFields = _sfpMutFrontend sourceParsers
+      sourcesMutationBackendFields = _sfpMutBackend sourceParsers
+      sourcesSubscriptionFields = _sfpSubscription sourceParsers
+      apolloFedTableParsers = _sfpApolloFed sourceParsers
   runMemoizeT $ do
-    -- build all sources (`apolloFedTableParsers` contains all the parsers and
-    -- type names, which are eligible for the `_Entity` Union)
-    (sourcesQueryFields, sourcesMutationFrontendFields, sourcesMutationBackendFields, sourcesSubscriptionFields, apolloFedTableParsers) <-
-      fmap mconcat $ for (toList sources) \sourceInfo ->
-        AB.dispatchAnyBackend @BackendSchema sourceInfo $ buildSource schemaContext schemaOptions
-
     -- build all actions
     -- we use the source context due to how async query relationships are implemented
     (actionsQueryFields, actionsMutationFields, actionsSubscriptionFields) <-
@@ -411,48 +448,128 @@ buildRoleContext sampledFeatureFlags options sources remotes actions customTypes
         remoteSchemaErrors,
         introspectionSchema
       )
+
+-- | Partition a 'SourceInfo b' into per-DB-schema slices so that each slice
+-- can be fed independently into 'buildSchemaRoleParsers'.  Tables and functions
+-- are assigned to their own schema; native queries (no schema component) are
+-- assigned only to the first schema alphabetically.
+partitionSourceBySchema ::
+  forall b.
+  (BackendMetadata b) =>
+  SourceInfo b ->
+  HashMap SchemaName (SourceInfo b)
+partitionSourceBySchema si@SourceInfo {..} =
+  HashMap.mapWithKey buildSlice allSchemas
   where
-    buildSource ::
-      forall b.
-      (BackendSchema b) =>
-      SchemaContext ->
-      SchemaOptions ->
-      SourceInfo b ->
-      MemoizeT
-        m
-        ( [FieldParser P.Parse (NamespacedField (QueryRootField UnpreparedValue))], -- query fields
-          [FieldParser P.Parse (NamespacedField (MutationRootField UnpreparedValue))], -- mutation backend fields
-          [FieldParser P.Parse (NamespacedField (MutationRootField UnpreparedValue))], -- mutation frontend fields
-          [FieldParser P.Parse (NamespacedField (QueryRootField UnpreparedValue))], -- subscription fields
-          [(G.Name, Parser 'Output P.Parse (ApolloFederationParserFunction P.Parse))] -- apollo federation tables
-        )
-    buildSource schemaContext schemaOptions sourceInfo@(SourceInfo {..}) =
-      runSourceSchema schemaContext schemaOptions sourceInfo do
-        let validFunctions = takeValidFunctions _siFunctions
-            validNativeQueries = takeValidNativeQueries _siNativeQueries
-            validStoredProcedures = takeValidStoredProcedures _siStoredProcedures
-            validTables = takeValidTables _siTables
-            mkRootFieldName = _rscRootFields _siCustomization
-            makeTypename = SC._rscTypeNames _siCustomization
-        (uncustomizedQueryRootFields, uncustomizedSubscriptionRootFields, apolloFedTableParsers) <-
-          buildQueryAndSubscriptionFields mkRootFieldName sourceInfo validTables validFunctions validNativeQueries validStoredProcedures
-        (,,,,apolloFedTableParsers)
-          <$> customizeFields
-            _siCustomization
-            (makeTypename <> MkTypename (<> Name.__query))
-            (pure uncustomizedQueryRootFields)
-          <*> customizeFields
-            _siCustomization
-            (makeTypename <> MkTypename (<> Name.__mutation_frontend))
-            (buildMutationFields mkRootFieldName Frontend sourceInfo validTables validFunctions)
-          <*> customizeFields
-            _siCustomization
-            (makeTypename <> MkTypename (<> Name.__mutation_backend))
-            (buildMutationFields mkRootFieldName Backend sourceInfo validTables validFunctions)
-          <*> customizeFields
-            _siCustomization
-            (makeTypename <> MkTypename (<> Name.__subscription))
-            (pure uncustomizedSubscriptionRootFields)
+    tableSchemas =
+      HashMap.fromListWith (\_ x -> x)
+        [(tableNameSchema @b tn, ()) | tn <- HashMap.keys _siTables]
+    functionSchemas =
+      HashMap.fromListWith (\_ x -> x)
+        [(functionNameSchema @b fn, ()) | fn <- HashMap.keys _siFunctions]
+    storedProcSchemas =
+      HashMap.fromListWith (\_ x -> x)
+        [(functionNameSchema @b fn, ()) | fn <- HashMap.keys _siStoredProcedures]
+    allSchemas = tableSchemas <> functionSchemas <> storedProcSchemas
+
+    -- Native queries have no schema component; assign them to the first schema.
+    firstSchema = listToMaybe $ sort $ HashMap.keys allSchemas
+
+    buildSlice schemaName _ =
+      si
+        { _siTables =
+            HashMap.filterWithKey (\tn _ -> tableNameSchema @b tn == schemaName) _siTables,
+          _siFunctions =
+            HashMap.filterWithKey (\fn _ -> functionNameSchema @b fn == schemaName) _siFunctions,
+          _siStoredProcedures =
+            HashMap.filterWithKey (\fn _ -> functionNameSchema @b fn == schemaName) _siStoredProcedures,
+          -- Native queries go to the first schema only; empty for all others.
+          _siNativeQueries =
+            if Just schemaName == firstSchema then _siNativeQueries else mempty,
+          -- Logical models are referenced by name only; include in all slices.
+          _siLogicalModels = _siLogicalModels
+        }
+
+-- | Build 'SchemaFieldParsers' for a single role using a schema-partitioned
+-- 'SourceInfo b'.  Analogous to the local @buildSource@ in 'buildRoleContext'
+-- but returns the structured 'SchemaFieldParsers' rather than a raw 5-tuple.
+buildSchemaRoleParsers ::
+  forall b m.
+  (BackendSchema b, MonadError QErr m, MonadIO m) =>
+  SchemaContext ->
+  SchemaOptions ->
+  SourceInfo b ->
+  MemoizeT m SchemaFieldParsers
+buildSchemaRoleParsers schemaContext schemaOptions sourceInfo@(SourceInfo {..}) =
+  runSourceSchema schemaContext schemaOptions sourceInfo do
+    let validFunctions = takeValidFunctions _siFunctions
+        validNativeQueries = takeValidNativeQueries _siNativeQueries
+        validStoredProcedures = takeValidStoredProcedures _siStoredProcedures
+        validTables = takeValidTables _siTables
+        mkRootFieldName = _rscRootFields _siCustomization
+        makeTypename = SC._rscTypeNames _siCustomization
+    (uncustomizedQueryFs, uncustomizedSubFs, apolloFed) <-
+      buildQueryAndSubscriptionFields mkRootFieldName sourceInfo validTables validFunctions validNativeQueries validStoredProcedures
+    qFs <-
+      customizeFields
+        _siCustomization
+        (makeTypename <> MkTypename (<> Name.__query))
+        (pure uncustomizedQueryFs)
+    mutFE <-
+      customizeFields
+        _siCustomization
+        (makeTypename <> MkTypename (<> Name.__mutation_frontend))
+        (buildMutationFields mkRootFieldName Frontend sourceInfo validTables validFunctions)
+    mutBE <-
+      customizeFields
+        _siCustomization
+        (makeTypename <> MkTypename (<> Name.__mutation_backend))
+        (buildMutationFields mkRootFieldName Backend sourceInfo validTables validFunctions)
+    sFs <-
+      customizeFields
+        _siCustomization
+        (makeTypename <> MkTypename (<> Name.__subscription))
+        (pure uncustomizedSubFs)
+    pure
+      SchemaFieldParsers
+        { _sfpQuery = qFs,
+          _sfpMutFrontend = mutFE,
+          _sfpMutBackend = mutBE,
+          _sfpSubscription = sFs,
+          _sfpApolloFed = apolloFed
+        }
+
+-- | Build per-role 'SchemaFieldParsers' for all roles using a single
+-- schema-partitioned 'SourceInfo b'.  Builds a fresh 'SchemaContext' for each
+-- role so that permission checks are applied correctly.
+buildAllRoleParsersForSchema ::
+  forall b m.
+  (BackendSchema b, MonadError QErr m, MonadIO m) =>
+  SchemaSampledFeatureFlags ->
+  SchemaOptions ->
+  SourceCache ->
+  HashMap RemoteSchemaName RemoteSchemaCtx ->
+  Options.RemoteSchemaPermissions ->
+  [RoleName] ->
+  SourceInfo b ->
+  m (HashMap RoleName SchemaFieldParsers)
+buildAllRoleParsersForSchema sampledFeatureFlags schemaOptions sources remotes remoteSchemaPermsCtx roles filteredSi =
+  fmap HashMap.fromList $ for roles $ \role -> do
+    let schemaContext =
+          SchemaContext
+            HasuraSchema
+            ( remoteRelationshipField
+                schemaContext
+                schemaOptions
+                sources
+                remotes
+                remoteSchemaPermsCtx
+                IncludeRemoteSourceRelationship
+            )
+            role
+            sampledFeatureFlags
+    parsers <- runMemoizeT $ buildSchemaRoleParsers schemaContext schemaOptions filteredSi
+    pure (role, parsers)
 
 buildRelayRoleContext ::
   forall m.

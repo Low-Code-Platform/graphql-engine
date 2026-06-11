@@ -49,8 +49,11 @@ import Hasura.Eventing.Backend
 import Hasura.Function.API
 import Hasura.Function.Cache
 import Hasura.Function.Metadata (FunctionMetadata (..))
-import Hasura.GraphQL.Schema (buildGQLContext)
+import Hasura.GraphQL.Context (GQLContext, RoleContext)
+import Hasura.GraphQL.Schema (SchemaFieldParsers, buildAllRoleParsersForSchema, buildGQLContext, buildSchemaOptions, partitionSourceBySchema)
+import Hasura.GraphQL.Schema.Backend (BackendSchema)
 import Hasura.GraphQL.Schema.Common
+import Hasura.GraphQL.Schema.Instances ()
 import Hasura.Incremental qualified as Inc
 import Hasura.Logging
 import Hasura.LogicalModel.Cache (LogicalModelCache, LogicalModelInfo (..))
@@ -99,6 +102,7 @@ import Hasura.RQL.Types.NamingCase
 import Hasura.RQL.Types.OpenTelemetry
 import Hasura.RQL.Types.QueryCollection
 import Hasura.RQL.Types.Relationships.Remote
+import Hasura.RQL.Types.Schema.Options qualified as Options
 import Hasura.RQL.Types.ScheduledTrigger
 import Hasura.RQL.Types.SchemaCache
 import Hasura.RQL.Types.SchemaCache.Build
@@ -407,33 +411,6 @@ buildSourcesIntrospectionStatus sourcesMetadata remoteSchemasMetadata = \case
     allPresent :: (Hashable a) => [a] -> InsOrdHashMap a b -> Bool
     allPresent list = all (`elem` list) . InsOrdHashMap.keys
 
-{- Note [Avoiding GraphQL schema rebuilds when changing irrelevant Metadata]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-There are many Metadata operations that don't influence the GraphQL schema.  So
-we should be caching its construction.
-
-The `Hasura.Incremental` framework allows us to cache such constructions:
-whenever we have an arrow `Rule m a b`, where `a` is the input to the arrow and
-`b` the output, we can use the `Inc.cache` combinator to obtain a new arrow
-which is only re-executed when the input `a` changes in a material way.  To test
-this, `a` needs an `Eq` instance.
-
-We can't simply apply `Inc.cache` to the GraphQL schema cache building phase
-(`buildGQLContext`), because the inputs (components of `BuildOutputs` such as
-`SourceCache`) don't have an `Eq` instance.
-
-So the purpose of `buildOutputsAndSchema` is that we cach already at an earlier
-point, encompassing more computation.  The Metadata and invalidation keys (which
-have `Eq` instances) are used as a caching key, and `Inc.cache` can be applied
-to the whole sequence of steps.
-
-But because of the all-or-nothing nature of caching, it's important that
-`buildOutputsAndSchema` is re-run as little as possible.  So the exercise
-becomes to minimize the amount of stuff stored in `BuildOutputs`, so that as
-many Metadata operations as possible can be handled outside of this codepath
-that produces a GraphQL schema.
--}
-
 buildSchemaCacheRule ::
   -- Note: by supplying BuildReason via MonadReader, it does not participate in caching, which is
   -- what we want!
@@ -461,7 +438,7 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
   metadataDep <- Inc.newDependency -< metadata
 
   (inconsistentObjects, storedIntrospections, (resolvedOutputs, dependencyInconsistentObjects, resolvedDependencies), ((adminIntrospection, gqlContext, gqlContextUnauth, inconsistentRemoteSchemas), (relayContext, relayContextUnauth), schemaRegistryAction)) <-
-    Inc.cache buildOutputsAndSchema -< (metadataDep, dynamicConfig, invalidationKeysDep, storedIntrospection)
+    buildOutputsAndSchema -< (metadataDep, dynamicConfig, invalidationKeysDep, storedIntrospection)
 
   let storedIntrospectionStatus = buildSourcesIntrospectionStatus _metaSources _metaRemoteSchemas storedIntrospections
       (resolvedEndpoints, endpointCollectedInfo) = runIdentity $ runWriterT $ buildRESTEndpoints _metaQueryCollections (InsOrdHashMap.elems _metaRestEndpoints)
@@ -578,27 +555,130 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
 
   returnA -< (schemaCache, (storedIntrospectionStatus, schemaRegistryAction))
   where
-    -- See Note [Avoiding GraphQL schema rebuilds when changing irrelevant Metadata]
     buildOutputsAndSchema = proc (metadataDep, dynamicConfig, invalidationKeysDep, storedIntrospection) -> do
       (outputs, collectedInfo) <- runWriterA buildAndCollectInfo -< (dynamicConfig, metadataDep, invalidationKeysDep, storedIntrospection)
       let (inconsistentObjects, unresolvedDependencies, storedIntrospections) = partitionCollectedInfo collectedInfo
       out2@(resolvedOutputs, _dependencyInconsistentObjects, _resolvedDependencies) <- resolveDependencies -< (outputs, unresolvedDependencies)
-      out3 <-
-        bindA
-          -< do
-            buildGQLContext
-              (_cdcSchemaSampledFeatureFlags dynamicConfig)
-              (_cdcFunctionPermsCtx dynamicConfig)
-              (_cdcRemoteSchemaPermsCtx dynamicConfig)
+      let sources = _boSources resolvedOutputs
+          allRemoteSchemas = _boRemoteSchemas resolvedOutputs
+          allActions = _boActions resolvedOutputs
+          allActionInfos = HashMap.elems allActions
+          schemaOptions =
+            buildSchemaOptions
+              (_cdcSQLGenCtx dynamicConfig, _cdcFunctionPermsCtx dynamicConfig)
               (_cdcExperimentalFeatures dynamicConfig)
-              (_cdcSQLGenCtx dynamicConfig)
-              (_cdcApolloFederationStatus dynamicConfig)
-              (_boSources resolvedOutputs)
-              (_boRemoteSchemas resolvedOutputs)
-              (_boActions resolvedOutputs)
-              (_boCustomTypes resolvedOutputs)
-              mSchemaRegistryContext
-              logger
+          -- Compute all roles from sources, actions, and remote schemas.
+          remoteSchemasRoles =
+            concatMap (HashMap.keys . _rscPermissions . fst . snd)
+              $ HashMap.toList allRemoteSchemas
+          actionRoles =
+            HS.insert adminRoleName
+              $ HS.fromList (allActionInfos ^.. folded . aiPermissions . to HashMap.keys . folded)
+              <> HS.fromList
+                ( bool mempty remoteSchemasRoles
+                    $ _cdcRemoteSchemaPermsCtx dynamicConfig
+                    == Options.EnableRemoteSchemaPermissions
+                )
+          allTableRoles = HS.fromList $ getTableRoles =<< HashMap.elems sources
+          allLogicalModelRoles = HS.fromList $ getLogicalModelRoles =<< HashMap.elems sources
+          allRoles = HS.toList $ actionRoles <> allTableRoles <> allLogicalModelRoles
+          remoteSchemaCtxs = fst <$> allRemoteSchemas
+          sourceSchemaKeysDep = Inc.selectD #_ikSourceSchemas invalidationKeysDep
+          metadataKeyDep = Inc.selectD #_ikMetadata invalidationKeysDep
+
+      -- Build per-role GQL field parsers for all sources, with each
+      -- (source, DB schema) pair cached independently in 'buildSchemaParsersForSchema'
+      -- so that DDL on one schema does not invalidate the others
+      -- (Phase 6 RFC, Step 5). Alongside the parsers, collect the
+      -- per-(source, schema) 'Inc.InvalidationKey' that was actually used, so
+      -- that 'buildGQLContextCached' below can be keyed off the same
+      -- invalidation granularity.
+      perSourceParsersAndKeys <-
+        (|
+          Inc.keyed
+            ( \_sourceName backendSourceInfo ->
+                AB.dispatchAnyBackendArrow @BackendSchema @BackendMetadata
+                  ( proc
+                      ( si :: SourceInfo b,
+                        (sources', remoteSchemaCtxs', schemaOptions', remoteSchemaPermsCtx', sff', allRoles', sourceSchemaKeysDep', metadataKeyDep')
+                        )
+                    -> do
+                      let sourceName = _siName si
+                          schemaMap = partitionSourceBySchema @b si
+                      perSchemaResults <-
+                        (|
+                          Inc.keyed
+                            ( \_schemaName (filteredSi, schemaKeyDep) -> do
+                                metadataKeyValue <- Inc.dependOn -< metadataKeyDep'
+                                schemaKeyValue <- Inc.dependOn -< schemaKeyDep
+                                let effectiveInvalidationKey = fromMaybe metadataKeyValue schemaKeyValue
+                                    effectiveKey = (effectiveInvalidationKey, allRoles')
+                                parsers <-
+                                  buildSchemaParsersForSchema
+                                    -<
+                                      KeyedBy
+                                        effectiveKey
+                                        (sff', schemaOptions', sources', remoteSchemaCtxs', remoteSchemaPermsCtx', allRoles', filteredSi)
+                                returnA -< (parsers, effectiveInvalidationKey)
+                            )
+                          |)
+                          ( HashMap.mapWithKey
+                              (\schemaName filteredSi -> (filteredSi, Inc.selectKeyD (sourceName, schemaName) sourceSchemaKeysDep'))
+                              schemaMap
+                          )
+                      let parsers = foldl' (HashMap.unionWith (<>)) mempty (fst <$> HashMap.elems perSchemaResults)
+                          schemaKeys = snd <$> perSchemaResults
+                      returnA -< (parsers, schemaKeys)
+                  )
+                  -<
+                    ( backendSourceInfo,
+                      (sources, remoteSchemaCtxs, schemaOptions, _cdcRemoteSchemaPermsCtx dynamicConfig, _cdcSchemaSampledFeatureFlags dynamicConfig, allRoles, sourceSchemaKeysDep, metadataKeyDep)
+                    )
+            )
+          |)
+          sources
+
+      let mergedParsers :: HashMap RoleName SchemaFieldParsers
+          mergedParsers = foldl' (HashMap.unionWith (<>)) mempty (fst <$> HashMap.elems perSourceParsersAndKeys)
+
+          perSourceSchemaKeys :: HashMap SourceName (HashMap SchemaName Inc.InvalidationKey)
+          perSourceSchemaKeys = snd <$> perSourceParsersAndKeys
+
+      metadataValue <- Inc.dependOn -< metadataDep
+      remoteSchemaInvalidationKeys <- Inc.dependOn -< Inc.selectD #_ikRemoteSchemas invalidationKeysDep
+
+      -- The full GQL context (per-role parsers, introspection schemas, etc.)
+      -- is expensive to assemble and is otherwise rebuilt on every
+      -- 'buildOutputsAndSchema' invocation (Phase 6 RFC, Step 7 removed the
+      -- coarse outer 'Inc.cache'). Cache it, keyed on everything that can
+      -- affect its output: metadata content (covers actions, custom types,
+      -- remote schema definitions, source/table tracking), the per-schema
+      -- invalidation keys actually used to build 'mergedParsers' and the
+      -- per-schema table caches in 'sources', remote schema invalidation
+      -- (covers remote introspection refresh), the active role set, and the
+      -- dynamic schema-build configuration.
+      let gqlContextCacheKey :: GQLContextCacheKey
+          gqlContextCacheKey = (metadataValue, perSourceSchemaKeys, remoteSchemaInvalidationKeys, allRoles, dynamicConfig)
+
+      out3 <-
+        buildGQLContextCached
+          -<
+            KeyedBy
+              gqlContextCacheKey
+              ( _cdcSchemaSampledFeatureFlags dynamicConfig,
+                _cdcFunctionPermsCtx dynamicConfig,
+                _cdcRemoteSchemaPermsCtx dynamicConfig,
+                _cdcExperimentalFeatures dynamicConfig,
+                _cdcSQLGenCtx dynamicConfig,
+                _cdcApolloFederationStatus dynamicConfig,
+                sources,
+                mergedParsers,
+                allRemoteSchemas,
+                allActions,
+                _boCustomTypes resolvedOutputs,
+                mSchemaRegistryContext,
+                logger
+              )
       returnA -< (inconsistentObjects, storedIntrospections, out2, out3)
 
     resolveBackendInfo' ::
@@ -858,6 +938,113 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
              namingConv,
              logicalModels
            )
+
+    -- Per-(source, DB schema) wrapper around 'buildAllRoleParsersForSchema'.
+    --
+    -- 'Inc.cache'-wraps the call so that each schema's GQL field parsers are
+    -- memoised independently. 'SourceInfo b' and 'SourceCache' have no useful
+    -- 'Eq' instance, so they are carried in the un-compared payload of
+    -- 'KeyedBy' -- caching is driven entirely by 'effectiveKey', which combines
+    -- the schema/metadata 'Inc.InvalidationKey' (see 'buildTableCacheForSchema')
+    -- with the current role list, so that adding/removing a role also
+    -- triggers a rebuild.
+    buildSchemaParsersForSchema ::
+      forall b arr m.
+      ( ArrowChoice arr,
+        Inc.ArrowCache m arr,
+        MonadError QErr m,
+        MonadIO m,
+        BackendSchema b,
+        BackendMetadata b
+      ) =>
+      KeyedBy
+        (Inc.InvalidationKey, [RoleName])
+        ( SchemaSampledFeatureFlags,
+          Options.SchemaOptions,
+          SourceCache,
+          HashMap RemoteSchemaName RemoteSchemaCtx,
+          Options.RemoteSchemaPermissions,
+          [RoleName],
+          SourceInfo b
+        )
+        `arr` HashMap RoleName SchemaFieldParsers
+    buildSchemaParsersForSchema = Inc.cache proc
+      (KeyedBy _effectiveKey (sampledFeatureFlags, schemaOptions, sources, remotes, remoteSchemaPermsCtx, roles, filteredSi)) ->
+        bindA -< buildAllRoleParsersForSchema sampledFeatureFlags schemaOptions sources remotes remoteSchemaPermsCtx roles filteredSi
+
+    -- 'Inc.cache'-wraps the final assembly of the GQL/Relay contexts
+    -- ('buildGQLContext'). This is the expensive step (parser construction,
+    -- introspection schema generation, for every role) that previously ran
+    -- unconditionally on every 'buildOutputsAndSchema' invocation. Caching is
+    -- driven entirely by 'GQLContextCacheKey' (see its definition for what it
+    -- covers); 'SourceCache', 'SchemaFieldParsers', etc. have no useful 'Eq'
+    -- instance and are carried in the un-compared payload of 'KeyedBy'.
+    buildGQLContextCached ::
+      forall arr m.
+      ( ArrowChoice arr,
+        Inc.ArrowCache m arr,
+        MonadError QErr m,
+        MonadIO m
+      ) =>
+      KeyedBy
+        GQLContextCacheKey
+        ( SchemaSampledFeatureFlags,
+          Options.InferFunctionPermissions,
+          Options.RemoteSchemaPermissions,
+          HashSet ExperimentalFeature,
+          SQLGenCtx,
+          ApolloFederationStatus,
+          SourceCache,
+          HashMap RoleName SchemaFieldParsers,
+          HashMap RemoteSchemaName (RemoteSchemaCtx, MetadataObject),
+          ActionCache,
+          AnnotatedCustomTypes,
+          Maybe SchemaRegistryContext,
+          Logger Hasura
+        )
+        `arr` ( ( G.SchemaIntrospection,
+                  HashMap RoleName (RoleContext GQLContext),
+                  GQLContext,
+                  HashSet InconsistentMetadata
+                ),
+                ( HashMap RoleName (RoleContext GQLContext),
+                  GQLContext
+                ),
+                SchemaRegistryAction
+              )
+    buildGQLContextCached = Inc.cache proc
+      ( KeyedBy
+          _key
+          ( sampledFeatureFlags,
+            functionPermsCtx,
+            remoteSchemaPermsCtx,
+            experimentalFeatures,
+            sqlGenCtx,
+            apolloFederationStatus,
+            sources,
+            mergedParsers,
+            remotes,
+            actions,
+            customTypes,
+            schemaRegistryContext,
+            gqlLogger
+            )
+        ) ->
+        bindA
+          -< buildGQLContext
+            sampledFeatureFlags
+            functionPermsCtx
+            remoteSchemaPermsCtx
+            experimentalFeatures
+            sqlGenCtx
+            apolloFederationStatus
+            sources
+            mergedParsers
+            remotes
+            actions
+            customTypes
+            schemaRegistryContext
+            gqlLogger
 
     buildSource ::
       forall b arr m.
@@ -1813,6 +2000,35 @@ buildRemoteSchemaRemoteRelationship allSources remoteSchemaMap remoteSchema remo
       buildRemoteFieldInfo (remoteSchemaToLHSIdentifier remoteSchema) allowedLHSJoinFields rr allSources remoteSchemaMap
     recordDependenciesM metadataObject schemaObj (lhsDependency Seq.:<| rhsDependencies)
     pure remoteField
+
+-- | Cache key for 'buildGQLContextCached': the full GQL/Relay context is
+-- rebuilt only when one of these changes.
+--
+--   * 'Metadata' value -- covers actions, custom types, remote schema
+--     definitions, and source/table tracking.
+--   * Per-(source, schema) 'Inc.InvalidationKey's actually used to build
+--     'mergedParsers' and the corresponding per-schema table caches in
+--     'SourceCache'.
+--   * Per-remote-schema 'Inc.InvalidationKey's -- covers remote schema
+--     introspection refresh.
+--   * The active role set.
+--   * The dynamic schema-build configuration.
+type GQLContextCacheKey =
+  ( Metadata,
+    HashMap SourceName (HashMap SchemaName Inc.InvalidationKey),
+    HashMap RemoteSchemaName Inc.InvalidationKey,
+    [RoleName],
+    CacheDynamicConfig
+  )
+
+-- | Pairs a cache key @k@ with a payload @a@ whose 'Eq' instance (if any) is
+-- irrelevant to caching. The 'Eq' instance for 'KeyedBy' compares only the
+-- key, allowing 'Inc.cache' to be driven by @k@ even when @a@ contains values
+-- with no useful (or no) 'Eq' instance, such as 'SourceInfo b'.
+data KeyedBy k a = KeyedBy k a
+
+instance (Eq k) => Eq (KeyedBy k a) where
+  KeyedBy k1 _ == KeyedBy k2 _ = k1 == k2
 
 data BackendInfoAndSourceMetadata b = BackendInfoAndSourceMetadata
   { _bcasmBackendInfo :: BackendInfo b,
