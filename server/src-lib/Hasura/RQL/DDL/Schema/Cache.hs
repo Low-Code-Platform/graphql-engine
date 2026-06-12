@@ -612,7 +612,34 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
                                 metadataKeyValue <- Inc.dependOn -< metadataKeyDep'
                                 schemaKeyValue <- Inc.dependOn -< schemaKeyDep
                                 let effectiveInvalidationKey = fromMaybe metadataKeyValue schemaKeyValue
-                                    effectiveKey = (effectiveInvalidationKey, allRoles')
+                                    -- Content fingerprint of the resolved, schema-filtered SourceInfo.
+                                    -- The invalidation keys above do NOT move for ordinary metadata
+                                    -- mutations: track/untrack/permission/relationship all go through
+                                    -- plain 'buildSchemaCache', which fires neither 'ciMetadata' nor
+                                    -- 'ciSourceSchemas'. Without this fingerprint, 'buildSchemaParsersForSchema'
+                                    -- (whose 'KeyedBy' compares only the key, ignoring 'filteredSi') would
+                                    -- serve stale parsers — e.g. a newly tracked table in an existing
+                                    -- schema would never appear. TableInfo/FunctionInfo/etc. have ToJSON,
+                                    -- and '_siTables' JSON includes columns, permissions and relationships,
+                                    -- so this also captures DB-introspection changes (e.g. run_sql ALTER)
+                                    -- for free.
+                                    --
+                                    -- We can't 'toJSON' the caches directly (their 'TableName'/'FunctionName'
+                                    -- keys have no 'ToJSONKey' under 'BackendMetadata b', and 'HashMap.elems'
+                                    -- order is non-deterministic). Instead we serialize each value (the name
+                                    -- is embedded in the value) and sort by its encoding for a stable,
+                                    -- key-class-free fingerprint.
+                                    fingerprintCache :: (ToJSON v) => HashMap.HashMap k v -> Value
+                                    fingerprintCache = toJSON . sortOn encode . map toJSON . HashMap.elems
+                                    schemaContentKey =
+                                      toJSON
+                                        [ fingerprintCache (_siTables filteredSi),
+                                          fingerprintCache (_siFunctions filteredSi),
+                                          fingerprintCache (_siNativeQueries filteredSi),
+                                          fingerprintCache (_siStoredProcedures filteredSi),
+                                          fingerprintCache (_siLogicalModels filteredSi)
+                                        ]
+                                    effectiveKey = (schemaContentKey, effectiveInvalidationKey, allRoles')
                                 parsers <-
                                   buildSchemaParsersForSchema
                                     -<
@@ -958,7 +985,8 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
         BackendMetadata b
       ) =>
       KeyedBy
-        (Inc.InvalidationKey, [RoleName])
+        -- (per-schema content fingerprint, effective invalidation key, role set)
+        (Value, Inc.InvalidationKey, [RoleName])
         ( SchemaSampledFeatureFlags,
           Options.SchemaOptions,
           SourceCache,

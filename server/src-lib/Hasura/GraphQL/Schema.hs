@@ -12,8 +12,9 @@ module Hasura.GraphQL.Schema
   )
 where
 
-import Control.Concurrent.Extended (concurrentlyEIO, forConcurrentlyEIO)
+import Control.Concurrent.Extended (forConcurrentlyEIO)
 import Control.Concurrent.STM qualified as STM
+import Control.Exception qualified as E
 import Control.Lens hiding (contexts)
 import Control.Monad.Memoize
 import Data.Aeson.Ordered qualified as JO
@@ -82,6 +83,7 @@ import Hasura.Server.Types
 import Hasura.StoredProcedure.Cache (StoredProcedureCache, _spiReturns)
 import Hasura.Table.Cache
 import Language.GraphQL.Draft.Syntax qualified as G
+import System.IO.Unsafe (unsafeInterleaveIO)
 
 -------------------------------------------------------------------------------
 
@@ -94,6 +96,13 @@ data SchemaFieldParsers = SchemaFieldParsers
     _sfpMutBackend :: [FieldParser P.Parse (NamespacedField (MutationRootField UnpreparedValue))],
     _sfpSubscription :: [FieldParser P.Parse (NamespacedField (QueryRootField UnpreparedValue))],
     _sfpApolloFed :: [(G.Name, Parser 'Output P.Parse (ApolloFederationParserFunction P.Parse))]
+    -- NOTE: Relay fields are intentionally NOT cached per (source, schema).
+    -- The Relay @Node@ interface (and @PageInfo@ etc.) is a single global type
+    -- spanning every source/schema; building the per-schema connection types in
+    -- separate memoize tables mints divergent @Node@ definitions (each carrying
+    -- only its partition's tables) and triggers "conflicting definitions for
+    -- GraphQL type 'Node'".  The full Relay schema is therefore built once per
+    -- role, in a single memoize pass, in 'assembleRelayRoleContext'.
   }
 
 instance Semigroup SchemaFieldParsers where
@@ -135,6 +144,19 @@ type RoleContextValue = (RoleContext GQLContext, HashSet InconsistentMetadata, G
 -- fields conflict, and only keep schemas that don't generate any. This results
 -- in a partial schema being available to the users, and a better error message
 -- than would arise from 'safeSelectionSet'.
+
+-- | Carries a 'QErr' from a Relay role-context build that was deferred via
+-- 'unsafeInterleaveIO' (see 'buildGQLContext'), so the error can be raised when
+-- the lazily-built context is first forced (e.g. on the first @/v1beta1/relay@
+-- request). In practice this should never fire: if the Relay schema were going
+-- to fail to build, the Hasura schema build would already have failed eagerly.
+newtype RelayBuildException = RelayBuildException QErr
+
+instance Show RelayBuildException where
+  show (RelayBuildException qerr) = "RelayBuildException " <> show (showQErr qerr)
+
+instance E.Exception RelayBuildException
+
 buildGQLContext ::
   forall m.
   ( MonadError QErr m,
@@ -189,41 +211,56 @@ buildGQLContext
         -- All roles: from pre-computed source parsers plus action/remote-schema roles
         allRoles = actionRoles <> HashMap.keysSet mergedSourceParsers
 
-    contexts <-
-      -- Build role contexts in parallel. We'd prefer deterministic parallelism
-      -- but that isn't really achievable (see mono #3829). NOTE: the admin role
-      -- will still be a bottleneck here, even on huge_schema which has many
-      -- roles.
+    -- Build the Hasura role contexts eagerly and in parallel. We'd prefer
+    -- deterministic parallelism but that isn't really achievable (see mono
+    -- #3829). NOTE: the admin role will still be a bottleneck here, even on
+    -- huge_schema which has many roles.
+    hasuraContexts <-
       fmap HashMap.fromList
         $ forConcurrentlyEIO 10 (Set.toList allRoles)
-        $ \role -> do
+        $ \role ->
           (role,)
-            <$> concurrentlyEIO
-              ( assembleGQLContext
-                  sampledFeatureFlags
-                  (sqlGen, functionPermissions)
-                  sources
-                  allRemoteSchemas
-                  allActionInfos
-                  customTypes
-                  role
-                  remoteSchemaPermissions
-                  experimentalFeatures
-                  apolloFederationStatus
-                  mSchemaRegistryContext
-                  (HashMap.findWithDefault mempty role mergedSourceParsers)
-              )
-              ( buildRelayRoleContext
-                  (sqlGen, functionPermissions)
-                  sources
-                  allActionInfos
-                  customTypes
-                  role
-                  experimentalFeatures
-                  sampledFeatureFlags
-              )
-    let hasuraContexts = fst <$> contexts
-        relayContexts = snd <$> contexts
+            <$> assembleGQLContext
+              sampledFeatureFlags
+              (sqlGen, functionPermissions)
+              sources
+              allRemoteSchemas
+              allActionInfos
+              customTypes
+              role
+              remoteSchemaPermissions
+              experimentalFeatures
+              apolloFederationStatus
+              mSchemaRegistryContext
+              (HashMap.findWithDefault mempty role mergedSourceParsers)
+
+    -- Relay contexts are built LAZILY on first access to the @/v1beta1/relay@
+    -- endpoint, NOT on every schema rebuild. The full Relay schema spans every
+    -- source/schema (its global @Node@ interface forbids per-schema caching, so
+    -- it cannot be incrementally rebuilt like the Hasura schema) and costs
+    -- seconds to assemble, yet most deployments never use Relay. Each role's
+    -- context is memoised by 'unsafeInterleaveIO', so it is built at most once
+    -- after a given rebuild and reused thereafter. A build error (which cannot
+    -- occur unless the Hasura schema also failed to build) surfaces as a
+    -- 'RelayBuildException' when the context is first forced.
+    relayContexts <-
+      fmap HashMap.fromList
+        $ for (Set.toList allRoles)
+        $ \role -> do
+          lazyCtx <-
+            liftIO $ unsafeInterleaveIO $ do
+              res <-
+                runExceptT
+                  $ assembleRelayRoleContext
+                    (sqlGen, functionPermissions)
+                    sources
+                    allActionInfos
+                    customTypes
+                    role
+                    experimentalFeatures
+                    sampledFeatureFlags
+              either (E.throwIO . RelayBuildException) pure res
+          pure (role, lazyCtx)
 
     adminIntrospection <-
       case HashMap.lookup adminRoleName hasuraContexts of
@@ -496,12 +533,13 @@ partitionSourceBySchema si@SourceInfo {..} =
 buildSchemaRoleParsers ::
   forall b m.
   (BackendSchema b, MonadError QErr m, MonadIO m) =>
+  -- | Hasura schema context (HasuraSchema kind, remote relationships enabled)
   SchemaContext ->
   SchemaOptions ->
   SourceInfo b ->
   MemoizeT m SchemaFieldParsers
-buildSchemaRoleParsers schemaContext schemaOptions sourceInfo@(SourceInfo {..}) =
-  runSourceSchema schemaContext schemaOptions sourceInfo do
+buildSchemaRoleParsers hasuraSchemaContext schemaOptions sourceInfo@(SourceInfo {..}) =
+  runSourceSchema hasuraSchemaContext schemaOptions sourceInfo do
     let validFunctions = takeValidFunctions _siFunctions
         validNativeQueries = takeValidNativeQueries _siNativeQueries
         validStoredProcedures = takeValidStoredProcedures _siStoredProcedures
@@ -539,6 +577,58 @@ buildSchemaRoleParsers schemaContext schemaOptions sourceInfo@(SourceInfo {..}) 
           _sfpApolloFed = apolloFed
         }
 
+-- | Build the Relay per-source field parsers for a single schema partition.
+--
+-- This is exactly the local @buildSource@ helper that used to live inside
+-- 'buildRelayRoleContext', scoped to one DB schema so it is memoised per
+-- (source, DB schema). It MUST be run in its own 'runMemoizeT', separate from
+-- 'buildSchemaRoleParsers': 'defaultTableSelectionSet' memoises on
+-- @(sourceName, tableName)@ only (not on the schema kind), so sharing a memo
+-- table with the Hasura build would make the Relay connection's @edges.node@
+-- reuse the Hasura (non-@Node@) selection set, producing conflicting
+-- definitions against the top-level @node@ field. The top-level @node@ field /
+-- @Node@ interface are NOT built here (they are cross-schema); they are added
+-- once per role in 'assembleRelayRoleContext'.
+buildSchemaRelayParsers ::
+  forall b m.
+  (BackendSchema b, MonadError QErr m, MonadIO m) =>
+  -- | Relay schema context (RelaySchema kind, remote relationships ignored)
+  SchemaContext ->
+  SchemaOptions ->
+  SourceInfo b ->
+  MemoizeT
+    m
+    ( [FieldParser P.Parse (NamespacedField (QueryRootField UnpreparedValue))],
+      [FieldParser P.Parse (NamespacedField (MutationRootField UnpreparedValue))],
+      [FieldParser P.Parse (NamespacedField (MutationRootField UnpreparedValue))],
+      [FieldParser P.Parse (NamespacedField (QueryRootField UnpreparedValue))]
+    )
+buildSchemaRelayParsers relaySchemaContext schemaOptions sourceInfo@(SourceInfo {..}) =
+  runSourceSchema relaySchemaContext schemaOptions sourceInfo do
+    let validFunctions = takeValidFunctions _siFunctions
+        validTables = takeValidTables _siTables
+        mkRootFieldName = _rscRootFields _siCustomization
+        makeTypename = SC._rscTypeNames _siCustomization
+    (uncustomizedRelayQueryFs, uncustomizedRelaySubFs) <-
+      buildRelayQueryAndSubscriptionFields mkRootFieldName sourceInfo validTables validFunctions
+    (,,,)
+      <$> customizeFields
+        _siCustomization
+        (makeTypename <> MkTypename (<> Name.__query))
+        (pure uncustomizedRelayQueryFs)
+      <*> customizeFields
+        _siCustomization
+        (makeTypename <> MkTypename (<> Name.__mutation_frontend))
+        (buildMutationFields mkRootFieldName Frontend sourceInfo validTables validFunctions)
+      <*> customizeFields
+        _siCustomization
+        (makeTypename <> MkTypename (<> Name.__mutation_backend))
+        (buildMutationFields mkRootFieldName Backend sourceInfo validTables validFunctions)
+      <*> customizeFields
+        _siCustomization
+        (makeTypename <> MkTypename (<> Name.__subscription))
+        (pure uncustomizedRelaySubFs)
+
 -- | Build per-role 'SchemaFieldParsers' for all roles using a single
 -- schema-partitioned 'SourceInfo b'.  Builds a fresh 'SchemaContext' for each
 -- role so that permission checks are applied correctly.
@@ -555,11 +645,11 @@ buildAllRoleParsersForSchema ::
   m (HashMap RoleName SchemaFieldParsers)
 buildAllRoleParsersForSchema sampledFeatureFlags schemaOptions sources remotes remoteSchemaPermsCtx roles filteredSi =
   fmap HashMap.fromList $ for roles $ \role -> do
-    let schemaContext =
+    let hasuraSchemaContext =
           SchemaContext
             HasuraSchema
             ( remoteRelationshipField
-                schemaContext
+                hasuraSchemaContext
                 schemaOptions
                 sources
                 remotes
@@ -568,10 +658,26 @@ buildAllRoleParsersForSchema sampledFeatureFlags schemaOptions sources remotes r
             )
             role
             sampledFeatureFlags
-    parsers <- runMemoizeT $ buildSchemaRoleParsers schemaContext schemaOptions filteredSi
-    pure (role, parsers)
+    -- Only the Hasura query/mutation/subscription parsers are schema-partitioned
+    -- and cached here. The Relay schema is built separately, once per role, in
+    -- 'assembleRelayRoleContext' (see the note on 'SchemaFieldParsers'): its
+    -- global 'Node' interface cannot be split across per-schema memoize tables
+    -- without producing conflicting type definitions.
+    hasuraParsers <- runMemoizeT $ buildSchemaRoleParsers hasuraSchemaContext schemaOptions filteredSi
+    pure (role, hasuraParsers)
 
-buildRelayRoleContext ::
+-- | Assemble the per-role Relay 'RoleContext'.
+--
+-- Unlike the Hasura schema (which is built per (source, DB schema) and cached
+-- in 'buildSchemaRoleParsers'), the Relay schema is built here in full, once per
+-- role, in a SINGLE 'runMemoizeT'. This is mandatory: the Relay @Node@ interface
+-- (and @PageInfo@ etc.) is a single global type whose '_ifObjects' spans every
+-- relay-enabled table across all sources/schemas. Building the per-source/-schema
+-- connection types in separate memoize tables would mint divergent @Node@
+-- definitions and fail with "conflicting definitions for GraphQL type 'Node'".
+-- The per-source Relay fields are built by 'buildSchemaRelayParsers' over the
+-- full 'SourceCache' inside the same memoize pass as 'nodeField'/'nodeInterface'.
+assembleRelayRoleContext ::
   forall m.
   (MonadError QErr m, MonadIO m) =>
   (SQLGenCtx, Options.InferFunctionPermissions) ->
@@ -582,7 +688,7 @@ buildRelayRoleContext ::
   Set.HashSet ExperimentalFeature ->
   SchemaSampledFeatureFlags ->
   m (RoleContext GQLContext)
-buildRelayRoleContext options sources actions customTypes role expFeatures schemaSampledFeatureFlags = do
+assembleRelayRoleContext options sources actions customTypes role expFeatures schemaSampledFeatureFlags = do
   let schemaOptions = buildSchemaOptions options expFeatures
       -- TODO: At the time of writing this, remote schema queries are not supported in relay.
       -- When they are supported, we should get do what `buildRoleContext` does. Since, they
@@ -596,14 +702,12 @@ buildRelayRoleContext options sources actions customTypes role expFeatures schem
           role
           schemaSampledFeatureFlags
   runMemoizeT do
-    -- build all sources, and the node root
-    (node, fieldsList) <- do
-      node <- fmap NotNamespaced <$> nodeField sources schemaContext schemaOptions
-      fieldsList <-
-        for (toList sources) \sourceInfo ->
-          AB.dispatchAnyBackend @BackendSchema sourceInfo (buildSource schemaContext schemaOptions)
-      pure (node, fieldsList)
-
+    -- Build the global @node@ root AND every source's Relay fields in this single
+    -- memoize table, so the cross-schema @Node@ interface is constructed exactly once.
+    node <- fmap NotNamespaced <$> nodeField sources schemaContext schemaOptions
+    fieldsList <-
+      for (toList sources) \exists ->
+        AB.dispatchAnyBackend @BackendSchema exists (buildSchemaRelayParsers schemaContext schemaOptions)
     let (queryFields, mutationFrontendFields, mutationBackendFields, subscriptionFields) = mconcat fieldsList
         allQueryFields = node : queryFields
         allSubscriptionFields = node : subscriptionFields
@@ -656,45 +760,6 @@ buildRelayRoleContext options sources actions customTypes role expFeatures schem
             (finalizeParser <$> subscriptionParser)
 
     pure $ RoleContext frontendContext $ Just backendContext
-  where
-    buildSource ::
-      forall b.
-      (BackendSchema b) =>
-      SchemaContext ->
-      SchemaOptions ->
-      SourceInfo b ->
-      MemoizeT
-        m
-        ( [FieldParser P.Parse (NamespacedField (QueryRootField UnpreparedValue))],
-          [FieldParser P.Parse (NamespacedField (MutationRootField UnpreparedValue))],
-          [FieldParser P.Parse (NamespacedField (MutationRootField UnpreparedValue))],
-          [FieldParser P.Parse (NamespacedField (QueryRootField UnpreparedValue))]
-        )
-    buildSource schemaContext schemaOptions sourceInfo@(SourceInfo {..}) = do
-      runSourceSchema schemaContext schemaOptions sourceInfo do
-        let validFunctions = takeValidFunctions _siFunctions
-            validTables = takeValidTables _siTables
-            mkRootFieldName = _rscRootFields _siCustomization
-            makeTypename = SC._rscTypeNames _siCustomization
-        (uncustomizedQueryRootFields, uncustomizedSubscriptionRootFields) <-
-          buildRelayQueryAndSubscriptionFields mkRootFieldName sourceInfo validTables validFunctions
-        (,,,)
-          <$> customizeFields
-            _siCustomization
-            (makeTypename <> MkTypename (<> Name.__query))
-            (pure uncustomizedQueryRootFields)
-          <*> customizeFields
-            _siCustomization
-            (makeTypename <> MkTypename (<> Name.__mutation_frontend))
-            (buildMutationFields mkRootFieldName Frontend sourceInfo validTables validFunctions)
-          <*> customizeFields
-            _siCustomization
-            (makeTypename <> MkTypename (<> Name.__mutation_backend))
-            (buildMutationFields mkRootFieldName Backend sourceInfo validTables validFunctions)
-          <*> customizeFields
-            _siCustomization
-            (makeTypename <> MkTypename (<> Name.__subscription))
-            (pure uncustomizedSubscriptionRootFields)
 
 -- | Builds the schema context for unauthenticated users.
 --
