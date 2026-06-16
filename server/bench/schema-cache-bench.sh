@@ -89,9 +89,11 @@ create_tbl() { runsql "{\"type\":\"run_sql\",\"args\":{\"source\":\"$SOURCE\",\"
 drop_tbl()   { runsql "{\"type\":\"run_sql\",\"args\":{\"source\":\"$SOURCE\",\"cascade\":true,\"sql\":\"DROP TABLE IF EXISTS \\\"$1\\\".\\\"$2\\\";\"}}"; }
 track_q()    { meta "{\"type\":\"pg_track_table\",\"args\":{\"source\":\"$SOURCE\",\"table\":{\"name\":\"$2\",\"schema\":\"$1\"}}}" >/dev/null; }
 
-# print a per-rep table + averages for one operation across the 3 sizes
+# print a per-rep table + averages for one operation across the 3 sizes.
+# If BENCH_TSV is set, also append "title<TAB>small_avg<TAB>medium_avg<TAB>large_avg"
+# to that file, for machine-readable A/B comparison (see schema-cache-bench-compare.sh).
 report() { # title  small_csv  medium_csv  large_csv
-  TITLE="$1" A0="$2" A1="$3" A2="$4" L0="$SMALL_LABEL" L1="$MEDIUM_LABEL" L2="$LARGE_LABEL" python3 -c '
+  TITLE="$1" A0="$2" A1="$3" A2="$4" L0="$SMALL_LABEL" L1="$MEDIUM_LABEL" L2="$LARGE_LABEL" BENCH_TSV="${BENCH_TSV:-}" python3 -c '
 import os
 title = os.environ["TITLE"]
 labels = [os.environ["L0"], os.environ["L1"], os.environ["L2"]]
@@ -107,6 +109,10 @@ avgs = [sum(c) / len(c) for c in data]
 print("  " + "-" * (len(hdr) - 2))
 print("  %-5s | " % "avg" + " | ".join("%-20.3f" % a for a in avgs))
 print("  -> medium/small = %.2fx , large/small = %.2fx" % (avgs[1] / avgs[0], avgs[2] / avgs[0]))
+tsv = os.environ.get("BENCH_TSV")
+if tsv:
+    with open(tsv, "a") as f:
+        f.write("\t".join([title] + ["%.3f" % a for a in avgs]) + "\n")
 '
 }
 
@@ -179,6 +185,14 @@ echo "LARGE :  $LARGE_SCHEMA  ($LARGE_N tables)  -> $LARGE_SCHEMA.$LARGE_TABLE"
 echo "reps:    $REPS"
 [ "$MEDIUM_N" = "$LARGE_N" ] && echo "NOTE: medium and large have the SAME table count — no real gradient (see header)."
 echo "==============================================================="
+
+# Start a fresh machine-readable TSV (when requested), seeded with a #meta line.
+if [ -n "${BENCH_TSV:-}" ]; then
+  : > "$BENCH_TSV"
+  printf '#meta\tsource=%s\tsmall=%s(%s)\tmedium=%s(%s)\tlarge=%s(%s)\ttotal=%s\n' \
+    "$SOURCE" "$SMALL_SCHEMA" "$SMALL_N" "$MEDIUM_SCHEMA" "$MEDIUM_N" "$LARGE_SCHEMA" "$LARGE_N" "$TOTAL_N" >> "$BENCH_TSV"
+  echo "(writing machine-readable averages to $BENCH_TSV)"
+fi
 
 # --- 3. Warmup (settle parser caches for all 3 schemas + both code paths) -----
 for i in 0 1 2; do
