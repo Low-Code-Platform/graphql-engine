@@ -646,7 +646,14 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
                                       KeyedBy
                                         effectiveKey
                                         (sff', schemaOptions', sources', remoteSchemaCtxs', remoteSchemaPermsCtx', allRoles', filteredSi)
-                                returnA -< (parsers, effectiveInvalidationKey)
+                                -- Carry the content fingerprint (not just the invalidation key) up to
+                                -- 'gqlContextCacheKey'. 'buildSchemaParsersForSchema' is keyed on
+                                -- 'effectiveKey' (which includes 'schemaContentKey'), so the parsers
+                                -- rebuild when a schema's content changes (e.g. 'run_sql' ALTER ADD
+                                -- COLUMN) even though the invalidation keys don't move. The GQL context
+                                -- must invalidate on the same condition, otherwise 'buildGQLContextCached'
+                                -- serves a stale schema built from the previous parsers.
+                                returnA -< (parsers, (schemaContentKey, effectiveInvalidationKey))
                             )
                           |)
                           ( HashMap.mapWithKey
@@ -668,7 +675,7 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
       let mergedParsers :: HashMap RoleName SchemaFieldParsers
           mergedParsers = foldl' (HashMap.unionWith (<>)) mempty (fst <$> HashMap.elems perSourceParsersAndKeys)
 
-          perSourceSchemaKeys :: HashMap SourceName (HashMap SchemaName Inc.InvalidationKey)
+          perSourceSchemaKeys :: HashMap SourceName (HashMap SchemaName (Value, Inc.InvalidationKey))
           perSourceSchemaKeys = snd <$> perSourceParsersAndKeys
 
       metadataValue <- Inc.dependOn -< metadataDep
@@ -680,8 +687,9 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
       -- coarse outer 'Inc.cache'). Cache it, keyed on everything that can
       -- affect its output: metadata content (covers actions, custom types,
       -- remote schema definitions, source/table tracking), the per-schema
-      -- invalidation keys actually used to build 'mergedParsers' and the
-      -- per-schema table caches in 'sources', remote schema invalidation
+      -- content fingerprint + invalidation keys actually used to build
+      -- 'mergedParsers' (so DB-introspection changes like 'run_sql' ALTER
+      -- invalidate the context too), remote schema invalidation
       -- (covers remote introspection refresh), the active role set, and the
       -- dynamic schema-build configuration.
       let gqlContextCacheKey :: GQLContextCacheKey
@@ -2043,7 +2051,10 @@ buildRemoteSchemaRemoteRelationship allSources remoteSchemaMap remoteSchema remo
 --   * The dynamic schema-build configuration.
 type GQLContextCacheKey =
   ( Metadata,
-    HashMap SourceName (HashMap SchemaName Inc.InvalidationKey),
+    -- Per (source, schema): the content fingerprint AND the invalidation key. The content
+    -- fingerprint is required so DB-introspection changes that don't move the invalidation keys
+    -- or 'Metadata' (e.g. 'run_sql' ALTER ADD COLUMN) still invalidate the cached GQL context.
+    HashMap SourceName (HashMap SchemaName (Value, Inc.InvalidationKey)),
     HashMap RemoteSchemaName Inc.InvalidationKey,
     [RoleName],
     CacheDynamicConfig
