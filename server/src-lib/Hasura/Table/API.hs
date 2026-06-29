@@ -178,8 +178,12 @@ trackExistingTableOrViewPhase1 source tableName = do
     <<> " already exists"
 
 queryForExistingFieldNames :: SchemaCache -> Vector Text
-queryForExistingFieldNames schemaCache = do
-  let GQLContext queryParser _ _ = scUnauthenticatedGQLContext schemaCache
+queryForExistingFieldNames schemaCache =
+  -- The unauthenticated context is now split per (source, schema); union the
+  -- existing root-field names across every pair (Phase 1).
+  foldMap fieldNamesForContext (HashMap.elems (scUnauthenticatedGQLContext schemaCache))
+  where
+    fieldNamesForContext (GQLContext queryParser _ _) =
       -- {
       --   __schema {
       --     queryType {
@@ -189,51 +193,51 @@ queryForExistingFieldNames schemaCache = do
       --     }
       --   }
       -- }
-      introspectionQuery =
-        [ G.SelectionField
-            $ G.Field
-              Nothing
-              GName.___schema
-              mempty
-              []
-              [ G.SelectionField
-                  $ G.Field
-                    Nothing
-                    GName._queryType
-                    mempty
-                    []
-                    [ G.SelectionField
-                        $ G.Field
-                          Nothing
-                          GName._fields
-                          mempty
-                          []
-                          [ G.SelectionField
-                              $ G.Field
-                                Nothing
-                                GName._name
-                                mempty
-                                []
-                                []
-                          ]
-                    ]
-              ]
-        ]
-  case queryParser introspectionQuery of
-    Left _ -> mempty
-    Right results -> do
-      case InsOrdHashMap.lookup (mkUnNamespacedRootFieldAlias GName.___schema) results of
-        Just (RFRaw (JO.Object schema)) -> do
-          let names = do
-                JO.Object queryType <- JO.lookup "queryType" schema
-                JO.Array fields <- JO.lookup "fields" queryType
-                for fields \case
-                  JO.Object field -> do
-                    JO.String name <- JO.lookup "name" field
-                    pure name
-                  _ -> Nothing
-          fromMaybe mempty $ names
-        _ -> mempty
+      let introspectionQuery =
+            [ G.SelectionField
+                $ G.Field
+                  Nothing
+                  GName.___schema
+                  mempty
+                  []
+                  [ G.SelectionField
+                      $ G.Field
+                        Nothing
+                        GName._queryType
+                        mempty
+                        []
+                        [ G.SelectionField
+                            $ G.Field
+                              Nothing
+                              GName._fields
+                              mempty
+                              []
+                              [ G.SelectionField
+                                  $ G.Field
+                                    Nothing
+                                    GName._name
+                                    mempty
+                                    []
+                                    []
+                              ]
+                        ]
+                  ]
+            ]
+       in case queryParser introspectionQuery of
+            Left _ -> mempty
+            Right results ->
+              case InsOrdHashMap.lookup (mkUnNamespacedRootFieldAlias GName.___schema) results of
+                Just (RFRaw (JO.Object schema)) ->
+                  let names = do
+                        JO.Object queryType <- JO.lookup "queryType" schema
+                        JO.Array fields <- JO.lookup "fields" queryType
+                        for fields \case
+                          JO.Object field -> do
+                            JO.String name <- JO.lookup "name" field
+                            pure name
+                          _ -> Nothing
+                   in fromMaybe mempty names
+                _ -> mempty
 
 -- | Check whether a given name would conflict with the current schema by doing
 -- an internal introspection

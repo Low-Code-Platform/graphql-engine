@@ -7,16 +7,18 @@ module Hasura.GraphQL.Schema
     buildSchemaOptions,
     buildSchemaRoleParsers,
     buildAllRoleParsersForSchema,
+    assemblePerPairContexts,
     partitionSourceBySchema,
     SchemaFieldParsers (..),
+    RoleContextValue,
   )
 where
 
-import Control.Concurrent.Extended (forConcurrentlyEIO)
 import Control.Concurrent.STM qualified as STM
 import Control.Exception qualified as E
 import Control.Lens hiding (contexts)
 import Control.Monad.Memoize
+import Data.Aeson qualified as J
 import Data.Aeson.Ordered qualified as JO
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashMap.Strict.InsOrd qualified as InsOrdHashMap
@@ -75,7 +77,7 @@ import Hasura.RQL.Types.Source
 import Hasura.RQL.Types.SourceCustomization as SC
 import Hasura.RemoteSchema.Metadata
 import Hasura.RemoteSchema.SchemaCache
-import Hasura.Backends.Postgres.SQL.Types (SchemaName)
+import Hasura.Backends.Postgres.SQL.Types (SchemaName, getSchemaTxt)
 import Hasura.RQL.Types.Metadata.Backend (BackendMetadata, functionNameSchema, tableNameSchema)
 import Hasura.SQL.AnyBackend qualified as AB
 import Hasura.Server.Init.Logging
@@ -169,20 +171,32 @@ buildGQLContext ::
   SQLGenCtx ->
   ApolloFederationStatus ->
   SourceCache ->
-  HashMap RoleName SchemaFieldParsers ->
+  -- | Per-role, per-(source, schema) field parsers. Unlike the old global build,
+  -- these are NOT merged across pairs: each (source, schema) is assembled into
+  -- its own 'GQLContext' (see @per-schema-gql-context.md@, Phase 1). Retained
+  -- here only to build the root-field routing index.
+  HashMap RoleName (HashMap (SourceName, SchemaName) SchemaFieldParsers) ->
+  -- | Per-role, per-(source, schema) GraphQL contexts, already assembled and
+  -- cached independently per pair in 'buildSchemaCacheRule' (§5.3, "where the
+  -- win is"): a mutation to one pair re-assembles only that pair, and this
+  -- function just stitches the cached results together. The 'RoleContextValue'
+  -- carries the role context, its assembly inconsistencies, and its
+  -- introspection universe.
+  HashMap RoleName (HashMap (SourceName, SchemaName) RoleContextValue) ->
   HashMap RemoteSchemaName (RemoteSchemaCtx, MetadataObject) ->
   ActionCache ->
   AnnotatedCustomTypes ->
   Maybe SchemaRegistryContext ->
   Logger Hasura ->
   m
-    ( -- Hasura schema
+    ( -- Hasura schema, split per (source, schema)
       ( G.SchemaIntrospection,
-        HashMap RoleName (RoleContext GQLContext),
-        GQLContext,
+        HashMap RoleName (HashMap (SourceName, SchemaName) (RoleContext GQLContext)),
+        HashMap (SourceName, SchemaName) GQLContext,
+        HashMap G.Name (SourceName, SchemaName),
         HashSet InconsistentMetadata
       ),
-      -- Relay schema
+      -- Relay schema (dormant; still built globally, admin-only deployments don't use it)
       ( HashMap RoleName (RoleContext GQLContext),
         GQLContext
       ),
@@ -194,9 +208,12 @@ buildGQLContext
   remoteSchemaPermissions
   experimentalFeatures
   sqlGen
-  apolloFederationStatus
+  -- 'apolloFederationStatus' is consumed by the per-pair assembly node (which
+  -- now runs in 'buildSchemaCacheRule'), not here.
+  _apolloFederationStatus
   sources
-  mergedSourceParsers
+  perPairParsers
+  perRolePairContexts
   allRemoteSchemas
   allActions
   customTypes
@@ -208,31 +225,8 @@ buildGQLContext
             $ Set.fromList (allActionInfos ^.. folded . aiPermissions . to HashMap.keys . folded)
             <> Set.fromList (bool mempty remoteSchemasRoles $ remoteSchemaPermissions == Options.EnableRemoteSchemaPermissions)
         allActionInfos = HashMap.elems allActions
-        -- All roles: from pre-computed source parsers plus action/remote-schema roles
-        allRoles = actionRoles <> HashMap.keysSet mergedSourceParsers
-
-    -- Build the Hasura role contexts eagerly and in parallel. We'd prefer
-    -- deterministic parallelism but that isn't really achievable (see mono
-    -- #3829). NOTE: the admin role will still be a bottleneck here, even on
-    -- huge_schema which has many roles.
-    hasuraContexts <-
-      fmap HashMap.fromList
-        $ forConcurrentlyEIO 10 (Set.toList allRoles)
-        $ \role ->
-          (role,)
-            <$> assembleGQLContext
-              sampledFeatureFlags
-              (sqlGen, functionPermissions)
-              sources
-              allRemoteSchemas
-              allActionInfos
-              customTypes
-              role
-              remoteSchemaPermissions
-              experimentalFeatures
-              apolloFederationStatus
-              mSchemaRegistryContext
-              (HashMap.findWithDefault mempty role mergedSourceParsers)
+        -- All roles: from pre-computed per-pair source parsers plus action/remote-schema roles
+        allRoles = actionRoles <> HashMap.keysSet perPairParsers
 
     -- Relay contexts are built LAZILY on first access to the @/v1beta1/relay@
     -- endpoint, NOT on every schema rebuild. The full Relay schema spans every
@@ -262,11 +256,58 @@ buildGQLContext
               either (E.throwIO . RelayBuildException) pure res
           pure (role, lazyCtx)
 
-    adminIntrospection <-
-      case HashMap.lookup adminRoleName hasuraContexts of
-        Just (_context, _errors, introspection) -> pure introspection
+    -- The per-(role, pair) 'RoleContext' map.
+    let contexts :: HashMap RoleName (HashMap (SourceName, SchemaName) (RoleContext GQLContext))
+        contexts = fmap (fmap (view _1)) perRolePairContexts
+
+        -- All assembly inconsistencies, collected across every (role, pair).
+        assemblyErrors :: HashSet InconsistentMetadata
+        assemblyErrors =
+          Set.unions
+            $ concatMap (fmap (view _2) . HashMap.elems)
+            $ HashMap.elems perRolePairContexts
+
+    -- The admin role's per-pair results: required for the global admin
+    -- introspection (allowlist / query-collection validation, schema registry).
+    adminPairResults <-
+      case HashMap.lookup adminRoleName perRolePairContexts of
+        Just r -> pure r
         Nothing -> throw500 "buildGQLContext failed to build for the admin role"
-    (unauthenticated, unauthenticatedRemotesErrors) <- unauthenticatedContext (sqlGen, functionPermissions) sources allRemoteSchemas experimentalFeatures sampledFeatureFlags remoteSchemaPermissions
+    let adminIntrospection = mergeSchemaIntrospections $ view _3 <$> HashMap.elems adminPairResults
+
+    -- The unauthenticated context, per pair. Admin-only deployment (locked
+    -- decision 5): the unauthenticated universe equals the admin frontend
+    -- schema. It is only consulted for internal conflict introspection;
+    -- unauthenticated GraphQL access is gated upstream.
+    let unauthenticated :: HashMap (SourceName, SchemaName) GQLContext
+        unauthenticated = _rctxDefault <$> HashMap.findWithDefault mempty adminRoleName contexts
+
+    -- Routing index: top-level root-field name -> owning (source, schema). Built
+    -- from the admin role's parsers (the superset of visible root fields). A name
+    -- mapping to two different pairs is a naming-convention misconfiguration and
+    -- is surfaced as an inconsistency.
+    let adminPairParsers = HashMap.findWithDefault mempty adminRoleName perPairParsers
+        (rootFieldSchema, routingConflicts) = buildRootFieldIndex adminPairParsers
+
+    -- A single global unauthenticated context is required only by the (dormant)
+    -- Relay transport slot. Building it spans every source (it is NOT split per
+    -- pair), so it would re-run on every schema rebuild and defeat the
+    -- per-(source, schema) incremental win (§5.3). Defer it with
+    -- 'unsafeInterleaveIO' — exactly as 'relayContexts' above — so the O(total)
+    -- unauthenticated build only happens if the dormant Relay slot is ever
+    -- forced. With no remote schemas its error set is empty, so nothing needs to
+    -- be surfaced eagerly into 'assemblyErrors'.
+    relayUnauthenticated <-
+      liftIO $ unsafeInterleaveIO $ do
+        res <-
+          runExceptT
+            $ unauthenticatedContext (sqlGen, functionPermissions) sources allRemoteSchemas experimentalFeatures sampledFeatureFlags remoteSchemaPermissions
+        either (E.throwIO . RelayBuildException) (pure . fst) res
+
+    -- Per-role merged introspection for the schema registry.
+    let perRoleIntrospection :: HashMap RoleName G.SchemaIntrospection
+        perRoleIntrospection =
+          fmap (mergeSchemaIntrospections . fmap (view _3) . HashMap.elems) perRolePairContexts
 
     writeToSchemaRegistryAction <-
       forM mSchemaRegistryContext $ \schemaRegistryCtx -> do
@@ -278,7 +319,7 @@ buildGQLContext
             pure $ \_ _ _ ->
               unLogger logger $ mkGenericLog @Text LevelWarn "schema-registry" ("Failed to fetch the time from metadata db correctly: " <> showQErr err)
           Right now -> do
-            let schemaRegistryMap = generateSchemaRegistryMap hasuraContexts
+            let schemaRegistryMap = generateSchemaRegistryMap perRoleIntrospection
                 projectSchemaInfo = \metadataResourceVersion inconsistentMetadata metadata ->
                   ProjectGQLSchemaInformation
                     schemaRegistryMap
@@ -298,26 +339,78 @@ buildGQLContext
 
     pure
       ( ( adminIntrospection,
-          view _1 <$> hasuraContexts,
+          contexts,
           unauthenticated,
-          Set.unions $ unauthenticatedRemotesErrors : (view _2 <$> HashMap.elems hasuraContexts)
+          rootFieldSchema,
+          assemblyErrors <> Set.fromList routingConflicts
         ),
         ( relayContexts,
           -- Currently, remote schemas are exposed through Relay, but ONLY through
           -- the unauthenticated role.  This is probably an oversight.  See
           -- hasura/graphql-engine-mono#3883.
-          unauthenticated
+          relayUnauthenticated
         ),
         writeToSchemaRegistryAction
       )
     where
       checkMdErrs = not . null
 
-      generateSchemaRegistryMap :: HashMap RoleName RoleContextValue -> SchemaRegistryMap
+      generateSchemaRegistryMap :: HashMap RoleName G.SchemaIntrospection -> SchemaRegistryMap
       generateSchemaRegistryMap mpr =
-        flip HashMap.mapWithKey mpr $ \r (_, _, schemaIntrospection) ->
+        flip HashMap.mapWithKey mpr $ \r schemaIntrospection ->
           let schemaSdl = generateSDL schemaIntrospection
            in (GQLSchemaInformation (SchemaSDL schemaSdl) (calculateSchemaSDLHash schemaSdl r))
+
+      -- Union the per-pair introspection universes into one global universe.
+      mergeSchemaIntrospections :: [G.SchemaIntrospection] -> G.SchemaIntrospection
+      mergeSchemaIntrospections =
+        G.SchemaIntrospection . HashMap.unions . fmap (\(G.SchemaIntrospection m) -> m)
+
+      -- Build the rootField -> (source, schema) routing index from one role's
+      -- per-pair parsers, surfacing any name claimed by two different pairs as
+      -- an inconsistency (a naming-convention misconfiguration, see §4).
+      buildRootFieldIndex ::
+        HashMap (SourceName, SchemaName) SchemaFieldParsers ->
+        (HashMap G.Name (SourceName, SchemaName), [InconsistentMetadata])
+      buildRootFieldIndex pairParsers =
+        foldl' insertName (mempty, []) entries
+        where
+          entries =
+            [ (name, pair)
+              | (pair, parsers) <- HashMap.toList pairParsers,
+                name <- pairRootFieldNames parsers
+            ]
+          insertName (idx, conflicts) (name, pair) =
+            case HashMap.lookup name idx of
+              Just existing
+                | existing /= pair ->
+                    (idx, routingConflict name existing pair : conflicts)
+              _ -> (HashMap.insert name pair idx, conflicts)
+
+      pairRootFieldNames :: SchemaFieldParsers -> [G.Name]
+      pairRootFieldNames SchemaFieldParsers {..} =
+        fmap (P.dName . P.fDefinition) _sfpQuery
+          <> fmap (P.dName . P.fDefinition) _sfpMutFrontend
+          <> fmap (P.dName . P.fDefinition) _sfpMutBackend
+          <> fmap (P.dName . P.fDefinition) _sfpSubscription
+
+      routingConflict :: G.Name -> (SourceName, SchemaName) -> (SourceName, SchemaName) -> InconsistentMetadata
+      routingConflict name (srcA, schA) (srcB, schB) =
+        InconsistentObject
+          ( "root field "
+              <> toTxt name
+              <> " is generated by multiple (source, schema) pairs: ("
+              <> toTxt srcA
+              <> ", "
+              <> getSchemaTxt schA
+              <> ") and ("
+              <> toTxt srcB
+              <> ", "
+              <> getSchemaTxt schB
+              <> "); type/root-field naming must uniquely encode (source, schema)"
+          )
+          Nothing
+          (MetadataObject (MOSource srcB) (J.toJSON name))
 
 buildSchemaOptions ::
   (SQLGenCtx, Options.InferFunctionPermissions) ->
@@ -485,6 +578,44 @@ assembleGQLContext sampledFeatureFlags options sources remotes actions customTyp
         remoteSchemaErrors,
         introspectionSchema
       )
+
+-- | Assemble every role's 'GQLContext' for a single @(source, schema)@ pair from
+-- that pair's per-role field parsers (§5.3). This is the expensive,
+-- introspection-heavy step ('assembleGQLContext' per role); running it here —
+-- inside the per-(source, schema) 'Inc.cache' node — is what makes a mutation to
+-- one pair re-assemble only that pair. With locked decisions (1) actions /
+-- remote schemas / custom types are empty and (3) each pair is self-contained,
+-- so the action/remote/custom-type inputs are passed empty.
+assemblePerPairContexts ::
+  forall m.
+  (MonadError QErr m, MonadIO m) =>
+  SchemaSampledFeatureFlags ->
+  (SQLGenCtx, Options.InferFunctionPermissions) ->
+  SourceCache ->
+  Options.RemoteSchemaPermissions ->
+  Set.HashSet ExperimentalFeature ->
+  ApolloFederationStatus ->
+  Maybe SchemaRegistryContext ->
+  HashMap RoleName SchemaFieldParsers ->
+  m (HashMap RoleName RoleContextValue)
+assemblePerPairContexts sampledFeatureFlags options sources remoteSchemaPermsCtx expFeatures apolloFederationStatus mSchemaRegistryContext roleParsers =
+  fmap HashMap.fromList
+    $ for (HashMap.toList roleParsers)
+    $ \(role, parsers) ->
+      (role,)
+        <$> assembleGQLContext
+          sampledFeatureFlags
+          options
+          sources
+          mempty
+          []
+          mempty
+          role
+          remoteSchemaPermsCtx
+          expFeatures
+          apolloFederationStatus
+          mSchemaRegistryContext
+          parsers
 
 -- | Partition a 'SourceInfo b' into per-DB-schema slices so that each slice
 -- can be fed independently into 'buildSchemaRoleParsers'.  Tables and functions

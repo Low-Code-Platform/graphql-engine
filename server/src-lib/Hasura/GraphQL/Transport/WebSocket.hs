@@ -490,6 +490,7 @@ onStart enabledLogTypes agentLicenseKey serverEnv wsConn shouldCaptureVariables 
   sqlGenCtx <- liftIO $ acSQLGenCtx <$> getAppContext appStateRef
   enableAL <- liftIO $ acEnableAllowlist <$> getAppContext appStateRef
   remoteSchemaResponsePriority <- liftIO $ acRemoteSchemaResponsePriority <$> getAppContext appStateRef
+  defaultGqlSchema <- liftIO $ (\appCtx -> (acDefaultSource appCtx, acDefaultSchema appCtx)) <$> getAppContext appStateRef
 
   (reqParsed, queryParts) <- Tracing.newSpan "Parse GraphQL" Tracing.SKInternal $ do
     reqParsedE <- lift $ E.checkGQLExecution userInfo (reqHdrs, ipAddress) enableAL sc q requestId
@@ -529,6 +530,7 @@ onStart enabledLogTypes agentLicenseKey serverEnv wsConn shouldCaptureVariables 
         responseErrorsConfig
         headerPrecedence
         traceQueryStatus
+        defaultGqlSchema
 
   (parameterizedQueryHash, execPlan, modelInfoList) <- onLeft execPlanE (withComplete . preExecErr granularPrometheusMetricsState requestId (Just gqlOpType) opName Nothing)
 

@@ -128,6 +128,7 @@ import Database.PG.Query qualified as PG
 import Hasura.Authentication.Role (RoleName)
 import Hasura.Authentication.User (UserInfoM)
 import Hasura.Backends.Postgres.Connection qualified as Postgres
+import Hasura.Backends.Postgres.SQL.Types (SchemaName)
 import Hasura.Base.Error
 import Hasura.Function.Cache
 import Hasura.GraphQL.Context (GQLContext, RoleContext)
@@ -575,8 +576,16 @@ data SchemaCache = SchemaCache
     scRemoteSchemas :: RemoteSchemaMap,
     scAllowlist :: InlinedAllowlist,
     scAdminIntrospection :: G.SchemaIntrospection,
-    scGQLContext :: HashMap RoleName (RoleContext GQLContext),
-    scUnauthenticatedGQLContext :: GQLContext,
+    -- | The served GraphQL schema is split into one independently-built context
+    -- per @(source, DB schema)@ pair (see @per-schema-gql-context.md@, Phase 1).
+    -- A request selects its target pair (via the routing index for data ops, or
+    -- the @x-hasura-source@/@x-hasura-schema@ headers for introspection).
+    scGQLContext :: HashMap RoleName (HashMap (SourceName, SchemaName) (RoleContext GQLContext)),
+    scUnauthenticatedGQLContext :: HashMap (SourceName, SchemaName) GQLContext,
+    -- | Routing index mapping each top-level root-field name to the
+    -- @(source, schema)@ pair that owns it, used to dispatch header-less data
+    -- operations to the right per-pair context.
+    scRootFieldSchema :: HashMap G.Name (SourceName, SchemaName),
     scRelayContext :: HashMap RoleName (RoleContext GQLContext),
     scUnauthenticatedRelayContext :: GQLContext,
     scDepMap :: DepMap,
@@ -604,8 +613,11 @@ instance ToJSON SchemaCache where
         "actions" .= toJSON scActions,
         "remote_schemas" .= toJSON scRemoteSchemas,
         "allowlist" .= toJSON scAllowlist,
-        "g_q_l_context" .= toJSON scGQLContext,
-        "unauthenticated_g_q_l_context" .= toJSON scUnauthenticatedGQLContext,
+        -- '(SourceName, SchemaName)' tuple keys have no 'ToJSONKey', so render
+        -- the per-pair maps as association lists for this debug-only instance.
+        "g_q_l_context" .= toJSON (HashMap.toList <$> scGQLContext),
+        "unauthenticated_g_q_l_context" .= toJSON (HashMap.toList scUnauthenticatedGQLContext),
+        "root_field_schema" .= toJSON (HashMap.toList scRootFieldSchema),
         "relay_context" .= toJSON scRelayContext,
         "unauthenticated_relay_context" .= toJSON scUnauthenticatedRelayContext,
         "dep_map" .= toJSON scDepMap,

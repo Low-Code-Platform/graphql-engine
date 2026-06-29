@@ -50,7 +50,7 @@ import Hasura.Function.API
 import Hasura.Function.Cache
 import Hasura.Function.Metadata (FunctionMetadata (..))
 import Hasura.GraphQL.Context (GQLContext, RoleContext)
-import Hasura.GraphQL.Schema (SchemaFieldParsers, buildAllRoleParsersForSchema, buildGQLContext, buildSchemaOptions, partitionSourceBySchema)
+import Hasura.GraphQL.Schema (RoleContextValue, SchemaFieldParsers, assemblePerPairContexts, buildAllRoleParsersForSchema, buildGQLContext, buildSchemaOptions, partitionSourceBySchema)
 import Hasura.GraphQL.Schema.Backend (BackendSchema)
 import Hasura.GraphQL.Schema.Common
 import Hasura.GraphQL.Schema.Instances ()
@@ -437,7 +437,7 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
       metadata@Metadata {..} = overrideMetadataDefaults metadataNoDefaults metadataDefaults
   metadataDep <- Inc.newDependency -< metadata
 
-  (inconsistentObjects, storedIntrospections, (resolvedOutputs, dependencyInconsistentObjects, resolvedDependencies), ((adminIntrospection, gqlContext, gqlContextUnauth, inconsistentRemoteSchemas), (relayContext, relayContextUnauth), schemaRegistryAction)) <-
+  (inconsistentObjects, storedIntrospections, (resolvedOutputs, dependencyInconsistentObjects, resolvedDependencies), ((adminIntrospection, gqlContext, gqlContextUnauth, rootFieldSchema, inconsistentRemoteSchemas), (relayContext, relayContextUnauth), schemaRegistryAction)) <-
     buildOutputsAndSchema -< (metadataDep, dynamicConfig, invalidationKeysDep, storedIntrospection)
 
   let storedIntrospectionStatus = buildSourcesIntrospectionStatus _metaSources _metaRemoteSchemas storedIntrospections
@@ -502,6 +502,7 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
             scAdminIntrospection = adminIntrospection,
             scGQLContext = gqlContext,
             scUnauthenticatedGQLContext = gqlContextUnauth,
+            scRootFieldSchema = rootFieldSchema,
             scRelayContext = relayContext,
             scUnauthenticatedRelayContext = relayContextUnauth,
             -- , scGCtxMap = gqlSchema
@@ -600,7 +601,7 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
                 AB.dispatchAnyBackendArrow @BackendSchema @BackendMetadata
                   ( proc
                       ( si :: SourceInfo b,
-                        (sources', remoteSchemaCtxs', schemaOptions', remoteSchemaPermsCtx', sff', allRoles', sourceSchemaKeysDep', metadataKeyDep')
+                        (sources', remoteSchemaCtxs', schemaOptions', remoteSchemaPermsCtx', sff', allRoles', sourceSchemaKeysDep', metadataKeyDep', dynamicConfig', mSchemaRegistryContext')
                         )
                     -> do
                       let sourceName = _siName si
@@ -639,41 +640,82 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
                                           fingerprintCache (_siStoredProcedures filteredSi),
                                           fingerprintCache (_siLogicalModels filteredSi)
                                         ]
-                                    effectiveKey = (schemaContentKey, effectiveInvalidationKey, allRoles')
+                                    -- 'dynamicConfig'' is part of the key because the parsers AND the
+                                    -- assembled context both depend on it (SQL-gen flags, experimental
+                                    -- features, Apollo federation, etc.); a config change must rebuild both.
+                                    effectiveKey = (schemaContentKey, effectiveInvalidationKey, allRoles', dynamicConfig')
                                 parsers <-
                                   buildSchemaParsersForSchema
                                     -<
                                       KeyedBy
                                         effectiveKey
                                         (sff', schemaOptions', sources', remoteSchemaCtxs', remoteSchemaPermsCtx', allRoles', filteredSi)
-                                -- Carry the content fingerprint (not just the invalidation key) up to
-                                -- 'gqlContextCacheKey'. 'buildSchemaParsersForSchema' is keyed on
-                                -- 'effectiveKey' (which includes 'schemaContentKey'), so the parsers
-                                -- rebuild when a schema's content changes (e.g. 'run_sql' ALTER ADD
-                                -- COLUMN) even though the invalidation keys don't move. The GQL context
-                                -- must invalidate on the same condition, otherwise 'buildGQLContextCached'
-                                -- serves a stale schema built from the previous parsers.
-                                returnA -< (parsers, (schemaContentKey, effectiveInvalidationKey))
+                                -- §5.3 "where the win is": assemble this pair's per-role 'GQLContext'
+                                -- right here, behind the SAME per-(source, schema) 'Inc.cache' key as its
+                                -- parsers, so a mutation to one pair re-assembles only that pair. Keyed on
+                                -- 'effectiveKey' (which includes 'schemaContentKey'), so the contexts
+                                -- rebuild when a schema's content changes (e.g. 'run_sql' ALTER ADD COLUMN)
+                                -- even though the invalidation keys don't move.
+                                pairContexts <-
+                                  assembleSchemaContextForSchema
+                                    -<
+                                      KeyedBy
+                                        effectiveKey
+                                        (dynamicConfig', sources', mSchemaRegistryContext', parsers)
+                                returnA -< ((parsers, pairContexts), (schemaContentKey, effectiveInvalidationKey))
                             )
                           |)
                           ( HashMap.mapWithKey
                               (\schemaName filteredSi -> (filteredSi, Inc.selectKeyD (sourceName, schemaName) sourceSchemaKeysDep'))
                               schemaMap
                           )
-                      let parsers = foldl' (HashMap.unionWith (<>)) mempty (fst <$> HashMap.elems perSchemaResults)
+                      -- Keep the per-schema results UN-merged so each (source, schema) pair stays
+                      -- independent (Phase 1). Each entry carries that DB schema's per-role
+                      -- 'SchemaFieldParsers' (for the routing index) and its per-role assembled
+                      -- 'RoleContextValue' (the cached context).
+                      let perSchemaParsers = (fst . fst) <$> perSchemaResults
+                          perSchemaContexts = (snd . fst) <$> perSchemaResults
                           schemaKeys = snd <$> perSchemaResults
-                      returnA -< (parsers, schemaKeys)
+                      returnA -< ((perSchemaParsers, perSchemaContexts), schemaKeys)
                   )
                   -<
                     ( backendSourceInfo,
-                      (sources, remoteSchemaCtxs, schemaOptions, _cdcRemoteSchemaPermsCtx dynamicConfig, _cdcSchemaSampledFeatureFlags dynamicConfig, allRoles, sourceSchemaKeysDep, metadataKeyDep)
+                      (sources, remoteSchemaCtxs, schemaOptions, _cdcRemoteSchemaPermsCtx dynamicConfig, _cdcSchemaSampledFeatureFlags dynamicConfig, allRoles, sourceSchemaKeysDep, metadataKeyDep, dynamicConfig, mSchemaRegistryContext)
                     )
             )
           |)
           sources
 
-      let mergedParsers :: HashMap RoleName SchemaFieldParsers
-          mergedParsers = foldl' (HashMap.unionWith (<>)) mempty (fst <$> HashMap.elems perSourceParsersAndKeys)
+      -- Invert the per-source/per-schema/per-role parser maps into the
+      -- per-role, per-(source, schema) shape that 'buildGQLContext' consumes.
+      -- No cross-pair merge: each (source, schema) keeps its own parsers so it
+      -- can be assembled and cached independently (Phase 1). Used only to build
+      -- the root-field routing index.
+      let perPairParsers :: HashMap RoleName (HashMap (SourceName, SchemaName) SchemaFieldParsers)
+          perPairParsers =
+            HashMap.fromListWith
+              (HashMap.unionWith (<>))
+              [ (role, HashMap.singleton (sourceName, schemaName) roleParsers)
+                | (sourceName, ((perSchemaParsers, _perSchemaContexts), _)) <- HashMap.toList perSourceParsersAndKeys,
+                  (schemaName, roleParsers') <- HashMap.toList perSchemaParsers,
+                  (role, roleParsers) <- HashMap.toList roleParsers'
+              ]
+
+          -- The per-(source, schema) assembled contexts, inverted to the
+          -- per-role, per-pair shape 'buildGQLContext' stitches together (§5.3).
+          -- Each value was assembled + cached independently per pair above.
+          -- '(SourceName, SchemaName)' is globally unique, so each (role, pair)
+          -- occurs once: 'HashMap.union' suffices (and 'RoleContextValue' has no
+          -- 'Semigroup', so 'unionWith (<>)' would not even typecheck).
+          perRolePairContexts :: HashMap RoleName (HashMap (SourceName, SchemaName) RoleContextValue)
+          perRolePairContexts =
+            HashMap.fromListWith
+              HashMap.union
+              [ (role, HashMap.singleton (sourceName, schemaName) roleContext)
+                | (sourceName, ((_perSchemaParsers, perSchemaContexts), _)) <- HashMap.toList perSourceParsersAndKeys,
+                  (schemaName, roleContexts') <- HashMap.toList perSchemaContexts,
+                  (role, roleContext) <- HashMap.toList roleContexts'
+              ]
 
           perSourceSchemaKeys :: HashMap SourceName (HashMap SchemaName (Value, Inc.InvalidationKey))
           perSourceSchemaKeys = snd <$> perSourceParsersAndKeys
@@ -707,7 +749,8 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
                 _cdcSQLGenCtx dynamicConfig,
                 _cdcApolloFederationStatus dynamicConfig,
                 sources,
-                mergedParsers,
+                perPairParsers,
+                perRolePairContexts,
                 allRemoteSchemas,
                 allActions,
                 _boCustomTypes resolvedOutputs,
@@ -993,8 +1036,9 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
         BackendMetadata b
       ) =>
       KeyedBy
-        -- (per-schema content fingerprint, effective invalidation key, role set)
-        (Value, Inc.InvalidationKey, [RoleName])
+        -- (per-schema content fingerprint, effective invalidation key, role set,
+        -- dynamic schema-build config)
+        (Value, Inc.InvalidationKey, [RoleName], CacheDynamicConfig)
         ( SchemaSampledFeatureFlags,
           Options.SchemaOptions,
           SourceCache,
@@ -1008,12 +1052,48 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
       (KeyedBy _effectiveKey (sampledFeatureFlags, schemaOptions, sources, remotes, remoteSchemaPermsCtx, roles, filteredSi)) ->
         bindA -< buildAllRoleParsersForSchema sampledFeatureFlags schemaOptions sources remotes remoteSchemaPermsCtx roles filteredSi
 
-    -- 'Inc.cache'-wraps the final assembly of the GQL/Relay contexts
-    -- ('buildGQLContext'). This is the expensive step (parser construction,
-    -- introspection schema generation, for every role) that previously ran
-    -- unconditionally on every 'buildOutputsAndSchema' invocation. Caching is
-    -- driven entirely by 'GQLContextCacheKey' (see its definition for what it
-    -- covers); 'SourceCache', 'SchemaFieldParsers', etc. have no useful 'Eq'
+    -- §5.3: per-(source, DB schema) assembly of the per-role 'GQLContext',
+    -- 'Inc.cache'd under the SAME 'effectiveKey' as the pair's parsers. This is
+    -- the expensive introspection-building step; caching it per pair is what
+    -- makes a mutation to one pair re-assemble only that pair. The parsers,
+    -- 'SourceCache' and registry context have no useful 'Eq' and ride in the
+    -- un-compared 'KeyedBy' payload; 'CacheDynamicConfig' is in the key so a
+    -- config change rebuilds the context.
+    assembleSchemaContextForSchema ::
+      forall arr m.
+      ( ArrowChoice arr,
+        Inc.ArrowCache m arr,
+        MonadError QErr m,
+        MonadIO m
+      ) =>
+      KeyedBy
+        (Value, Inc.InvalidationKey, [RoleName], CacheDynamicConfig)
+        ( CacheDynamicConfig,
+          SourceCache,
+          Maybe SchemaRegistryContext,
+          HashMap RoleName SchemaFieldParsers
+        )
+        `arr` HashMap RoleName RoleContextValue
+    assembleSchemaContextForSchema = Inc.cache proc
+      (KeyedBy _effectiveKey (dynamicConfig, sources, mSchemaRegistryContext, roleParsers)) ->
+        bindA
+          -< assemblePerPairContexts
+            (_cdcSchemaSampledFeatureFlags dynamicConfig)
+            (_cdcSQLGenCtx dynamicConfig, _cdcFunctionPermsCtx dynamicConfig)
+            sources
+            (_cdcRemoteSchemaPermsCtx dynamicConfig)
+            (_cdcExperimentalFeatures dynamicConfig)
+            (_cdcApolloFederationStatus dynamicConfig)
+            mSchemaRegistryContext
+            roleParsers
+
+    -- 'Inc.cache'-wraps the FINALIZATION of the GQL/Relay contexts
+    -- ('buildGQLContext'). After §5.3 the expensive per-pair assembly is cached
+    -- per (source, schema) in 'assembleSchemaContextForSchema' and arrives here
+    -- already built ('perRolePairContexts'); this step only stitches the cached
+    -- pairs together (introspection merge, routing index, lazy Relay) and is
+    -- cheap. Caching is driven entirely by 'GQLContextCacheKey' (see its
+    -- definition); 'SourceCache', 'SchemaFieldParsers', etc. have no useful 'Eq'
     -- instance and are carried in the un-compared payload of 'KeyedBy'.
     buildGQLContextCached ::
       forall arr m.
@@ -1031,7 +1111,8 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
           SQLGenCtx,
           ApolloFederationStatus,
           SourceCache,
-          HashMap RoleName SchemaFieldParsers,
+          HashMap RoleName (HashMap (SourceName, SchemaName) SchemaFieldParsers),
+          HashMap RoleName (HashMap (SourceName, SchemaName) RoleContextValue),
           HashMap RemoteSchemaName (RemoteSchemaCtx, MetadataObject),
           ActionCache,
           AnnotatedCustomTypes,
@@ -1039,8 +1120,9 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
           Logger Hasura
         )
         `arr` ( ( G.SchemaIntrospection,
-                  HashMap RoleName (RoleContext GQLContext),
-                  GQLContext,
+                  HashMap RoleName (HashMap (SourceName, SchemaName) (RoleContext GQLContext)),
+                  HashMap (SourceName, SchemaName) GQLContext,
+                  HashMap G.Name (SourceName, SchemaName),
                   HashSet InconsistentMetadata
                 ),
                 ( HashMap RoleName (RoleContext GQLContext),
@@ -1058,7 +1140,8 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
             sqlGenCtx,
             apolloFederationStatus,
             sources,
-            mergedParsers,
+            perPairParsers,
+            perRolePairContexts,
             remotes,
             actions,
             customTypes,
@@ -1075,7 +1158,8 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
             sqlGenCtx
             apolloFederationStatus
             sources
-            mergedParsers
+            perPairParsers
+            perRolePairContexts
             remotes
             actions
             customTypes

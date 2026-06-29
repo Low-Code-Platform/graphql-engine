@@ -35,6 +35,7 @@ import Hasura.Base.Error
 import Hasura.CredentialCache
 import Hasura.Eventing.Common (LockedEventsCtx)
 import Hasura.Eventing.EventTrigger
+import Hasura.Backends.Postgres.SQL.Types (SchemaName)
 import Hasura.GraphQL.Execute.Subscription.Options
 import Hasura.GraphQL.Execute.Subscription.State qualified as ES
 import Hasura.GraphQL.Schema.Common (SchemaSampledFeatureFlags, sampleFeatureFlags)
@@ -178,7 +179,11 @@ data AppContext = AppContext
     acSchemaSampledFeatureFlags :: SchemaSampledFeatureFlags,
     acRemoteSchemaResponsePriority :: RemoteSchemaResponsePriority,
     acHeaderPrecedence :: HeaderPrecedence,
-    acTraceQueryStatus :: TraceQueryStatus
+    acTraceQueryStatus :: TraceQueryStatus,
+    -- | Default @(source, schema)@ used to select a per-pair GraphQL context for
+    -- header-less introspection requests (see @per-schema-gql-context.md@ §4).
+    acDefaultSource :: Maybe SourceName,
+    acDefaultSchema :: Maybe SchemaName
   }
 
 -- | Collection of the LoggerCtx, the regular Logger and the PGLogger
@@ -303,7 +308,9 @@ buildAppContextRule = proc (ServeOptions {..}, env, _keys, checkFeatureFlag) -> 
           acSchemaSampledFeatureFlags = schemaSampledFeatureFlags,
           acRemoteSchemaResponsePriority = soRemoteSchemaResponsePriority,
           acHeaderPrecedence = soHeaderPrecedence,
-          acTraceQueryStatus = soTraceQueryStatus
+          acTraceQueryStatus = soTraceQueryStatus,
+          acDefaultSource = soDefaultSource,
+          acDefaultSchema = soDefaultSchema
         }
   where
     buildEventEngineCtx = Inc.cache proc (httpPoolSize, fetchInterval, fetchBatchSize) -> do
