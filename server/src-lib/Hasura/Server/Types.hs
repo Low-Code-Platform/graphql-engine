@@ -110,6 +110,14 @@ data ExperimentalFeature
   | EFDisablePostgresArrays
   | EFNoNullUnboundVariableDefault
   | EFRemoveEmptySubscriptionResponses
+  | -- | Build the (global, O(total)) Relay GraphQL schema served at
+    -- @/v1beta1/relay@. Relay's @Node@ interface spans every source/schema and
+    -- cannot be cached per-(source, schema) like the Hasura schema, so it is
+    -- rebuilt in full on every metadata change — dominating mutation latency on
+    -- large metadata. It is therefore **disabled by default**; deployments that
+    -- actually use the @/v1beta1/relay@ endpoint must opt in with this feature.
+    -- See @rfcs/per-schema-gql-context.md@ §12.11–§12.13.
+    EFEnableRelaySchema
   deriving (Bounded, Enum, Eq, Generic, Show)
 
 experimentalFeatureKey :: ExperimentalFeature -> Text
@@ -127,6 +135,7 @@ experimentalFeatureKey = \case
   EFDisablePostgresArrays -> "disable_postgres_arrays"
   EFNoNullUnboundVariableDefault -> "no_null_unbound_variable_default"
   EFRemoveEmptySubscriptionResponses -> "remove_empty_subscription_responses"
+  EFEnableRelaySchema -> "enable_relay_schema"
 
 instance Hashable ExperimentalFeature
 

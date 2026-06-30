@@ -1017,6 +1017,77 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
              logicalModels
            )
 
+    -- §12 (Phase 3): per-(source, DB schema) resolution of the table half of
+    -- 'buildSource' — relationships/computed fields ('addNonColumnFields') and
+    -- permissions ('buildTablePermissions') for ONE schema's tables. 'Inc.cache'd
+    -- on the schema's inputs (mirrors 'buildTableCacheForSchema') so a mutation to
+    -- one schema re-resolves only that schema's 'TableInfo's instead of all of the
+    -- source's. Safe under locked decision 3 (no cross-schema/cross-source
+    -- relationships): each schema's tables are resolved against only that schema's
+    -- slice ('rawTableInfos'), so any cross-schema reference fails to resolve and
+    -- surfaces as an inconsistency. With decisions 1+3 the @allSources@ /
+    -- remote-schema inputs to 'addNonColumnFields' are unused, so 'mempty' is
+    -- passed, keeping the cache key schema-local.
+    buildTableInfosForSchema ::
+      forall b arr m.
+      ( ArrowChoice arr,
+        Inc.ArrowCache m arr,
+        ArrowWriter (Seq CollectItem) arr,
+        MonadError QErr m,
+        MonadIO m,
+        MonadBaseControl IO m,
+        BackendMetadata b,
+        GetAggregationPredicatesDeps b
+      ) =>
+      ( SourceName,
+        SourceConfig b,
+        -- this schema's resolved table-core info (from 'buildTableCacheForSchema')
+        HashMap (TableName b) (TableCoreInfoG b (StructuredColumnInfo b) (ColumnInfo b)),
+        -- this schema's non-column inputs / permission inputs / event triggers
+        [NonColumnTableInputs b],
+        [TablePermissionInputs b],
+        HashMap (TableName b) (EventTriggerInfoMap b),
+        OrderedRoles,
+        HashMap LogicalModelName (LogicalModelMetadata b),
+        DBFunctionsMetadata b
+      )
+        `arr` HashMap (TableName b) (TableInfo b)
+    buildTableInfosForSchema = Inc.cache proc
+      (sourceName, sourceConfig, tablesRawInfo, nonColumnInputs, permissions, eventTriggerInfoMaps, orderedRoles, unifiedLogicalModelsHashMap, dbFunctions) -> do
+        let alignTableMap :: HashMap (TableName b) a -> HashMap (TableName b) c -> HashMap (TableName b) (a, c)
+            alignTableMap = HashMap.intersectionWith (,)
+            nonColumnsByTable = mapFromL _nctiTable nonColumnInputs
+
+        -- relationships and computed fields (intra-schema only, per decision 3)
+        tableCoreInfos :: HashMap (TableName b) (TableCoreInfo b) <-
+          interpretWriter
+            -< for (tablesRawInfo `alignTableMap` nonColumnsByTable) \(tableRawInfo, nonColumnInput) -> do
+              let columns = _tciFieldInfoMap tableRawInfo
+              allFields :: FieldInfoMap (FieldInfo b) <- addNonColumnFields mempty sourceName sourceConfig tablesRawInfo columns mempty dbFunctions nonColumnInput
+              pure $ tableRawInfo {_tciFieldInfoMap = allFields}
+
+        -- permissions
+        result <-
+          interpretWriter
+            -< runExceptT
+              $ for
+                (tableCoreInfos `alignTableMap` mapFromL _tpiTable permissions `alignTableMap` eventTriggerInfoMaps)
+                \((tableCoreInfo, permissionInputs), eventTriggerInfos) -> do
+                  let tableFields = _tciFieldInfoMap tableCoreInfo
+                  permissionInfos <-
+                    buildTablePermissions
+                      env
+                      sourceName
+                      sourceConfig
+                      tableCoreInfos
+                      (_tciName tableCoreInfo)
+                      tableFields
+                      permissionInputs
+                      orderedRoles
+                      unifiedLogicalModelsHashMap
+                  pure $ TableInfo tableCoreInfo permissionInfos eventTriggerInfos (mkAdminRolePermInfo tableCoreInfo)
+        bindA -< liftEither result
+
     -- Per-(source, DB schema) wrapper around 'buildAllRoleParsersForSchema'.
     --
     -- 'Inc.cache'-wraps the call so that each schema's GQL field parsers are
@@ -1178,60 +1249,28 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
         GetAggregationPredicatesDeps b
       ) =>
       ( CacheDynamicConfig,
-        HashMap SourceName (AB.AnyBackend PartiallyResolvedSource),
         SourceMetadata b,
         SourceConfig b,
-        HashMap (TableName b) (TableCoreInfoG b (StructuredColumnInfo b) (ColumnInfo b)),
-        HashMap (TableName b) (EventTriggerInfoMap b),
+        -- pre-built per-(source, schema) table cache (Phase 3, §12): the table
+        -- half of source resolution is now done + cached per schema in
+        -- 'buildTableInfosForSchema', and the slices are unioned by the caller.
+        HashMap (TableName b) (TableInfo b),
         DBObjectsIntrospection b,
-        PartiallyResolvedRemoteSchemaMap,
         OrderedRoles
       )
         `arr` (SourceInfo b)
-    buildSource = proc (dynamicConfig, allSources, sourceMetadata, sourceConfig, tablesRawInfo, eventTriggerInfoMaps, dbObjectsIntrospection, remoteSchemaMap, orderedRoles) -> do
+    buildSource = proc (dynamicConfig, sourceMetadata, sourceConfig, tableCache, dbObjectsIntrospection, orderedRoles) -> do
       let DBObjectsIntrospection _dbTables dbFunctions _scalars introspectedLogicalModels = dbObjectsIntrospection
-          SourceMetadata sourceName backendSourceKind tables functions nativeQueries storedProcedures logicalModels _ queryTagsConfig sourceCustomization _healthCheckConfig = sourceMetadata
-          tablesMetadata = InsOrdHashMap.elems tables
-          (_, nonColumnInputs, permissions) = unzip3 $ map mkTableInputs tablesMetadata
-          alignTableMap :: HashMap (TableName b) a -> HashMap (TableName b) c -> HashMap (TableName b) (a, c)
-          alignTableMap = HashMap.intersectionWith (,)
-
-      -- relationships and computed fields
-      let nonColumnsByTable = mapFromL _nctiTable nonColumnInputs
-      tableCoreInfos :: HashMap (TableName b) (TableCoreInfo b) <-
-        interpretWriter
-          -< for (tablesRawInfo `alignTableMap` nonColumnsByTable) \(tableRawInfo, nonColumnInput) -> do
-            let columns = _tciFieldInfoMap tableRawInfo
-            allFields :: FieldInfoMap (FieldInfo b) <- addNonColumnFields allSources sourceName sourceConfig tablesRawInfo columns remoteSchemaMap dbFunctions nonColumnInput
-            pure $ tableRawInfo {_tciFieldInfoMap = allFields}
+          SourceMetadata sourceName backendSourceKind _tables functions nativeQueries storedProcedures logicalModels _ queryTagsConfig sourceCustomization _healthCheckConfig = sourceMetadata
+          -- The table cache is pre-built per schema; derive the core infos that the
+          -- function / logical-model / native-query resolution below consumes.
+          tableCoreInfos :: HashMap (TableName b) (TableCoreInfo b)
+          tableCoreInfos = _tiCoreInfo <$> tableCache
 
       -- Combine logical models that come from DB schema introspection with logical models
       -- provided via metadata. If two logical models have the same name the one from metadata is preferred.
       let unifiedLogicalModels = logicalModels <> introspectedLogicalModels
           unifiedLogicalModelsHashMap = InsOrdHashMap.toHashMap unifiedLogicalModels
-
-      -- permissions
-      result <-
-        interpretWriter
-          -< runExceptT
-            $ for
-              (tableCoreInfos `alignTableMap` mapFromL _tpiTable permissions `alignTableMap` eventTriggerInfoMaps)
-              \((tableCoreInfo, permissionInputs), eventTriggerInfos) -> do
-                let tableFields = _tciFieldInfoMap tableCoreInfo
-                permissionInfos <-
-                  buildTablePermissions
-                    env
-                    sourceName
-                    sourceConfig
-                    tableCoreInfos
-                    (_tciName tableCoreInfo)
-                    tableFields
-                    permissionInputs
-                    orderedRoles
-                    unifiedLogicalModelsHashMap
-                pure $ TableInfo tableCoreInfo permissionInfos eventTriggerInfos (mkAdminRolePermInfo tableCoreInfo)
-      -- Generate a non-recoverable error when inherited roles were not ordered in a way that allows for building permissions to succeed
-      tableCache <- bindA -< liftEither result
 
       -- not forcing the evaluation here results in a measurable negative impact
       -- on memory residency as measured by our benchmark
@@ -1706,21 +1745,49 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
                 AB.dispatchAnyBackendArrow @BackendMetadata @GetAggregationPredicatesDeps
                   ( proc
                       ( partiallyResolvedSource :: PartiallyResolvedSource b,
-                        (dynamicConfig, allResolvedSources, remoteSchemaCtxMap, orderedRoles)
+                        -- 'allResolvedSources' / 'remoteSchemaCtxMap' fed the old cross-source
+                        -- relationship pass in 'buildSource'; with decisions 1+3 there are none,
+                        -- so they are unused now that table resolution is per-schema (Phase 3).
+                        (dynamicConfig, _allResolvedSources, _remoteSchemaCtxMap, orderedRoles)
                         )
                     -> do
                       let PartiallyResolvedSource sourceMetadata sourceConfig introspection tablesInfo eventTriggers = partiallyResolvedSource
+                          DBObjectsIntrospection _dbTables dbFunctions _scalars introspectedLogicalModels = introspection
+                          sourceName = _smName sourceMetadata
+                          tablesMetadata = InsOrdHashMap.elems (_smTables sourceMetadata)
+                          (_, nonColumnInputs, permissions) = unzip3 $ map mkTableInputs tablesMetadata
+                          unifiedLogicalModelsHashMap =
+                            InsOrdHashMap.toHashMap (_smLogicalModels sourceMetadata <> introspectedLogicalModels)
+                          -- Phase 3 (§12): group this source's resolution inputs by DB schema so
+                          -- each schema's 'TableInfo's are built + cached independently. The
+                          -- grouping is cheap O(total) HashMap work; the expensive per-table
+                          -- resolution becomes O(changed schema) via 'buildTableInfosForSchema'.
+                          allSchemas = HashMap.fromList [(tableNameSchema @b tn, ()) | tn <- HashMap.keys tablesInfo]
+                          schemaBundles =
+                            flip HashMap.mapWithKey allSchemas $ \schemaName _ ->
+                              ( HashMap.filterWithKey (\tn _ -> tableNameSchema @b tn == schemaName) tablesInfo,
+                                filter (\nci -> tableNameSchema @b (_nctiTable nci) == schemaName) nonColumnInputs,
+                                filter (\tpi -> tableNameSchema @b (_tpiTable tpi) == schemaName) permissions,
+                                HashMap.filterWithKey (\tn _ -> tableNameSchema @b tn == schemaName) eventTriggers
+                              )
+                      perSchemaTableCaches <-
+                        (|
+                          Inc.keyed
+                            ( \_schemaName (tablesSlice, nonColSlice, permSlice, etSlice) ->
+                                buildTableInfosForSchema
+                                  -< (sourceName, sourceConfig, tablesSlice, nonColSlice, permSlice, etSlice, orderedRoles, unifiedLogicalModelsHashMap, dbFunctions)
+                            )
+                          |)
+                          schemaBundles
+                      let tableCache = HashMap.unions (HashMap.elems perSchemaTableCaches)
                       so <-
                         buildSource
                           -<
                             ( dynamicConfig,
-                              allResolvedSources,
                               sourceMetadata,
                               sourceConfig,
-                              tablesInfo,
-                              eventTriggers,
+                              tableCache,
                               introspection,
-                              remoteSchemaCtxMap,
                               orderedRoles
                             )
                       let scalarParsingContext = getter sourceConfig

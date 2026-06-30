@@ -228,33 +228,37 @@ buildGQLContext
         -- All roles: from pre-computed per-pair source parsers plus action/remote-schema roles
         allRoles = actionRoles <> HashMap.keysSet perPairParsers
 
-    -- Relay contexts are built LAZILY on first access to the @/v1beta1/relay@
-    -- endpoint, NOT on every schema rebuild. The full Relay schema spans every
-    -- source/schema (its global @Node@ interface forbids per-schema caching, so
-    -- it cannot be incrementally rebuilt like the Hasura schema) and costs
-    -- seconds to assemble, yet most deployments never use Relay. Each role's
-    -- context is memoised by 'unsafeInterleaveIO', so it is built at most once
-    -- after a given rebuild and reused thereafter. A build error (which cannot
-    -- occur unless the Hasura schema also failed to build) surfaces as a
-    -- 'RelayBuildException' when the context is first forced.
+    -- Relay contexts are nominally deferred with 'unsafeInterleaveIO', but in
+    -- practice the schema-cache build forces them on every rebuild (the deferral
+    -- does not hold — see @rfcs/per-schema-gql-context.md@ §12.11). The full Relay
+    -- schema spans every source/schema (its global @Node@ interface forbids
+    -- per-schema caching, so it cannot be incrementally rebuilt like the Hasura
+    -- schema) and costs O(total) seconds to assemble — dominating mutation latency
+    -- on large metadata. It is therefore **disabled by default**: only built when a
+    -- deployment opts in with the 'EFEnableRelaySchema' experimental feature.
+    -- When disabled, relay requests fall back to the (empty) unauthenticated relay
+    -- context. A build error surfaces as a 'RelayBuildException' when first forced.
     relayContexts <-
-      fmap HashMap.fromList
-        $ for (Set.toList allRoles)
-        $ \role -> do
-          lazyCtx <-
-            liftIO $ unsafeInterleaveIO $ do
-              res <-
-                runExceptT
-                  $ assembleRelayRoleContext
-                    (sqlGen, functionPermissions)
-                    sources
-                    allActionInfos
-                    customTypes
-                    role
-                    experimentalFeatures
-                    sampledFeatureFlags
-              either (E.throwIO . RelayBuildException) pure res
-          pure (role, lazyCtx)
+      if EFEnableRelaySchema `Set.member` experimentalFeatures
+        then
+          fmap HashMap.fromList
+            $ for (Set.toList allRoles)
+            $ \role -> do
+              lazyCtx <-
+                liftIO $ unsafeInterleaveIO $ do
+                  res <-
+                    runExceptT
+                      $ assembleRelayRoleContext
+                        (sqlGen, functionPermissions)
+                        sources
+                        allActionInfos
+                        customTypes
+                        role
+                        experimentalFeatures
+                        sampledFeatureFlags
+                  either (E.throwIO . RelayBuildException) pure res
+              pure (role, lazyCtx)
+        else pure mempty
 
     -- The per-(role, pair) 'RoleContext' map.
     let contexts :: HashMap RoleName (HashMap (SourceName, SchemaName) (RoleContext GQLContext))
