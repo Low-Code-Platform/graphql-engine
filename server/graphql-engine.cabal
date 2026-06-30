@@ -838,6 +838,7 @@ library
                      , Hasura.RQL.Types.Metadata.Backend
                      , Hasura.RQL.Types.Metadata.Common
                      , Hasura.RQL.Types.Metadata.Instances
+                     , Hasura.RQL.Types.Metadata.Partition
                      , Hasura.RQL.Types.Metadata.Object
                      , Hasura.RQL.Types.Metadata.Serialization
                      , Hasura.RQL.Types.NamingCase

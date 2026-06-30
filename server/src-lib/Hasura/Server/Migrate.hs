@@ -49,6 +49,7 @@ import Hasura.RQL.Types.BackendType
 import Hasura.RQL.Types.Common
 import Hasura.RQL.Types.CustomTypes
 import Hasura.RQL.Types.Metadata
+import Hasura.RQL.Types.Metadata.Partition (splitMetadataBySchema)
 import Hasura.RQL.Types.OpenTelemetry (emptyOpenTelemetryConfig)
 import Hasura.RQL.Types.SchemaCache
 import Hasura.RQL.Types.SourceCustomization
@@ -309,7 +310,11 @@ migrations maybeDefaultSourceConfig dryRun maintenanceMode =
              ++ [|(MetadataCatalogVersion 3, MigrationPair from3To4 Nothing)|]
            : (migrationsFromFile [MetadataCatalogVersion 5 .. MetadataCatalogVersion 40] ++ migrationsFromFile [MetadataCatalogVersion 42])
              ++ [|(MetadataCatalogVersion 42, MigrationPair from42To43 (Just from43To42))|]
-           : migrationsFromFile [MetadataCatalogVersion 44 .. latestCatalogVersion]
+           -- 48 -> 49 (Phase 2 metadata partitioning) is a custom migration: the
+           -- SQL only creates the table, the Haskell step re-partitions the blob.
+           : ( migrationsFromFile [MetadataCatalogVersion 44 .. MetadataCatalogVersion 48]
+                 ++ [[|(MetadataCatalogVersion 48, MigrationPair from48To49 (Just from49To48))|]]
+             )
    )
   where
     runTxOrPrint :: PG.Query -> m ()
@@ -390,6 +395,44 @@ migrations maybeDefaultSourceConfig dryRun maintenanceMode =
             -- cron triggers are added in the `hdb_catalog.hdb_cron_triggers`
             addCronTriggerForeignKeyConstraint
           recreateSystemMetadata
+
+    -- Phase 2 (§11): partition the metadata catalog. Create the partition table,
+    -- then split the existing whole-metadata blob into a skeleton (written back
+    -- to hdb_metadata) plus one partition row per (source, schema). At this point
+    -- the partition table is empty, so 'fetchMetadataFromCatalog' reassembles to
+    -- exactly the pre-migration metadata.
+    from48To49 = do
+      let createPartitionTable = $(makeRelativeToProject "src-rsr/migrations/48_to_49.sql" >>= PG.sqlFromFile)
+      if dryRun
+        then (liftIO . TIO.putStrLn . PG.getQueryText) createPartitionTable
+        else do
+          multiQ createPartitionTable
+          fullMetadata <- liftTx fetchMetadataFromCatalog
+          let (skeleton, partitions) = splitMetadataBySchema fullMetadata
+          liftTx $ do
+            PG.unitQE
+              defaultTxErrorHandler
+              "UPDATE hdb_catalog.hdb_metadata SET metadata = $1::json"
+              (Identity $ PG.ViaJSON skeleton)
+              True
+            for_ partitions $ \(sourceName, schemaName, partition) ->
+              upsertMetadataPartitionInCatalog sourceName schemaName partition
+
+    -- Downgrade: reassemble the partitions back into the single blob, then drop
+    -- the partition table.
+    from49To48 = do
+      let dropPartitionTable = $(makeRelativeToProject "src-rsr/migrations/49_to_48.sql" >>= PG.sqlFromFile)
+      if dryRun
+        then (liftIO . TIO.putStrLn . PG.getQueryText) dropPartitionTable
+        else do
+          fullMetadata <- liftTx fetchMetadataFromCatalog
+          liftTx
+            $ PG.unitQE
+              defaultTxErrorHandler
+              "UPDATE hdb_catalog.hdb_metadata SET metadata = $1::json"
+              (Identity $ PG.ViaJSON fullMetadata)
+              True
+          multiQ dropPartitionTable
 
 multiQ :: (MonadTx m) => PG.Query -> m ()
 multiQ = liftTx . PG.multiQE defaultTxErrorHandler
