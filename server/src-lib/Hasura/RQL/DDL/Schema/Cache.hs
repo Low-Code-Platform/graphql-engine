@@ -1146,7 +1146,7 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
         )
         `arr` HashMap RoleName RoleContextValue
     assembleSchemaContextForSchema = Inc.cache proc
-      (KeyedBy _effectiveKey (dynamicConfig, sources, mSchemaRegistryContext, roleParsers)) ->
+      (KeyedBy _effectiveKey (dynamicConfig, sources, mSchemaRegistryCtx, roleParsers)) ->
         bindA
           -< assemblePerPairContexts
             (_cdcSchemaSampledFeatureFlags dynamicConfig)
@@ -1155,7 +1155,7 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
             (_cdcRemoteSchemaPermsCtx dynamicConfig)
             (_cdcExperimentalFeatures dynamicConfig)
             (_cdcApolloFederationStatus dynamicConfig)
-            mSchemaRegistryContext
+            mSchemaRegistryCtx
             roleParsers
 
     -- 'Inc.cache'-wraps the FINALIZATION of the GQL/Relay contexts
