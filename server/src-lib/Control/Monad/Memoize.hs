@@ -226,7 +226,7 @@ data MemoState = MemoState
 newtype MemoizeT m a = MemoizeT
   { unMemoizeT :: StateT MemoState m a
   }
-  deriving (Functor, Applicative, Monad, MonadError e, MonadReader r, MonadTrans)
+  deriving (Functor, Applicative, Monad, MonadError e, MonadReader r, MonadTrans, MonadIO)
 
 -- | Allow code in 'MemoizeT' to have access to any underlying state capabilities,
 -- hiding the fact that 'MemoizeT' itself is a state monad.

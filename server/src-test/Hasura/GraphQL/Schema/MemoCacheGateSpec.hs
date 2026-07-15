@@ -31,7 +31,7 @@ import Hasura.GraphQL.ApolloFederation (generateSDL)
 import Hasura.Server.Types (ApolloFederationStatus (..))
 import Hasura.GraphQL.Schema (assemblePerPairContexts, buildAllRoleParsersForSchema)
 import Hasura.GraphQL.Schema.Common (SchemaSampledFeatureFlags (..))
-import Hasura.GraphQL.Schema.MemoInvalidate (MemoStore, newMemoStore)
+import Hasura.GraphQL.Schema.TableFieldCache (TableFieldStore, newTableFieldStore)
 import Hasura.Prelude
 import Hasura.RQL.Types.BackendType (BackendSourceKind (PostgresVanillaKind), BackendType (Postgres), PostgresKind (Vanilla))
 import Hasura.RQL.Types.Column (ColumnType (..))
@@ -144,7 +144,7 @@ sourceAfter = mkSourceInfo [albumTableInfo, trackTableInfo True]
 --
 -- 'Nothing' builds cold (the default engine path); 'Just' seeds from the store and
 -- evicts, i.e. the 'EFPersistentMemoCache' path.
-runBuildSdl :: Maybe MemoStore -> SourceInfo PG -> IO Text
+runBuildSdl :: Maybe TableFieldStore -> SourceInfo PG -> IO Text
 runBuildSdl mStore sourceInfo = do
   result <- runExceptT do
     parsers <-
@@ -194,7 +194,7 @@ runBuildSdl mStore sourceInfo = do
 spec :: Spec
 spec = describe "persistent memo cache: incremental build == cold build" do
   it "reuse with no change at all preserves the SDL" do
-    store <- newMemoStore
+    store <- newTableFieldStore
     _ <- runBuildSdl (Just store) sourceBefore
     -- second pass reuses everything; nothing changed, so nothing may drift
     incremental <- runBuildSdl (Just store) sourceBefore
@@ -202,7 +202,7 @@ spec = describe "persistent memo cache: incremental build == cold build" do
     incremental `shouldBe` cold
 
   it "a changed table's own parsers are rebuilt, not reused stale" do
-    store <- newMemoStore
+    store <- newTableFieldStore
     _ <- runBuildSdl (Just store) sourceBefore
     incremental <- runBuildSdl (Just store) sourceAfter
     cold <- runBuildSdl Nothing sourceAfter
@@ -212,14 +212,14 @@ spec = describe "persistent memo cache: incremental build == cold build" do
   it "a change to track transitively rebuilds album, which embeds it" do
     -- This is the case the dependency graph exists for. album's key does not
     -- change, so only reverse reachability from track can save it.
-    store <- newMemoStore
+    store <- newTableFieldStore
     _ <- runBuildSdl (Just store) sourceBefore
     incremental <- runBuildSdl (Just store) sourceAfter
     cold <- runBuildSdl Nothing sourceAfter
     incremental `shouldBe` cold
 
   it "reverting a change also reverts the SDL" do
-    store <- newMemoStore
+    store <- newTableFieldStore
     _ <- runBuildSdl (Just store) sourceBefore
     _ <- runBuildSdl (Just store) sourceAfter
     incremental <- runBuildSdl (Just store) sourceBefore

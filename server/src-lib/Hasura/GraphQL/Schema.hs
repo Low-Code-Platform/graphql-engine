@@ -26,6 +26,7 @@ import Data.HashSet qualified as Set
 import Data.List.Extended (duplicates)
 import Data.Text.Extended
 import Data.Text.NonEmpty qualified as NT
+import Data.Typeable (Typeable)
 import Database.PG.Query.Pool qualified as PG
 import Hasura.Authentication.Role (RoleName, adminRoleName, mkRoleNameSafe)
 import Hasura.Base.Error
@@ -40,7 +41,8 @@ import Hasura.GraphQL.Schema.Backend
 import Hasura.GraphQL.Schema.Common
 import Hasura.GraphQL.Schema.Instances ()
 import Hasura.GraphQL.Schema.Introspect
-import Hasura.GraphQL.Schema.MemoInvalidate (MemoStore, withSchemaMemoCache)
+import Hasura.GraphQL.Schema.TableDeps (tableDependencyGraph)
+import Hasura.GraphQL.Schema.TableFieldCache (TableFieldStore, TableFieldsCacher (..), mkTableFieldsCacher, noTableFieldsCache, prepareForBuild)
 import Hasura.GraphQL.Schema.Parser
   ( FieldParser,
     Kind (..),
@@ -669,12 +671,14 @@ partitionSourceBySchema si@SourceInfo {..} =
 buildSchemaRoleParsers ::
   forall b m.
   (BackendSchema b, MonadError QErr m, MonadIO m) =>
+  -- | Phase 9 per-table field cache; 'noTableFieldsCache' rebuilds everything.
+  TableFieldsCacher b ->
   -- | Hasura schema context (HasuraSchema kind, remote relationships enabled)
   SchemaContext ->
   SchemaOptions ->
   SourceInfo b ->
   MemoizeT m SchemaFieldParsers
-buildSchemaRoleParsers hasuraSchemaContext schemaOptions sourceInfo@(SourceInfo {..}) =
+buildSchemaRoleParsers cacher hasuraSchemaContext schemaOptions sourceInfo@(SourceInfo {..}) =
   runSourceSchema hasuraSchemaContext schemaOptions sourceInfo do
     let validFunctions = takeValidFunctions _siFunctions
         validNativeQueries = takeValidNativeQueries _siNativeQueries
@@ -683,7 +687,7 @@ buildSchemaRoleParsers hasuraSchemaContext schemaOptions sourceInfo@(SourceInfo 
         mkRootFieldName = _rscRootFields _siCustomization
         makeTypename = SC._rscTypeNames _siCustomization
     (uncustomizedQueryFs, uncustomizedSubFs, apolloFed) <-
-      buildQueryAndSubscriptionFields mkRootFieldName sourceInfo validTables validFunctions validNativeQueries validStoredProcedures
+      buildQueryAndSubscriptionFields cacher mkRootFieldName sourceInfo validTables validFunctions validNativeQueries validStoredProcedures
     qFs <-
       customizeFields
         _siCustomization
@@ -693,12 +697,12 @@ buildSchemaRoleParsers hasuraSchemaContext schemaOptions sourceInfo@(SourceInfo 
       customizeFields
         _siCustomization
         (makeTypename <> MkTypename (<> Name.__mutation_frontend))
-        (buildMutationFields mkRootFieldName Frontend sourceInfo validTables validFunctions)
+        (buildMutationFields cacher mkRootFieldName Frontend sourceInfo validTables validFunctions)
     mutBE <-
       customizeFields
         _siCustomization
         (makeTypename <> MkTypename (<> Name.__mutation_backend))
-        (buildMutationFields mkRootFieldName Backend sourceInfo validTables validFunctions)
+        (buildMutationFields cacher mkRootFieldName Backend sourceInfo validTables validFunctions)
     sFs <-
       customizeFields
         _siCustomization
@@ -755,11 +759,11 @@ buildSchemaRelayParsers relaySchemaContext schemaOptions sourceInfo@(SourceInfo 
       <*> customizeFields
         _siCustomization
         (makeTypename <> MkTypename (<> Name.__mutation_frontend))
-        (buildMutationFields mkRootFieldName Frontend sourceInfo validTables validFunctions)
+        (buildMutationFields noTableFieldsCache mkRootFieldName Frontend sourceInfo validTables validFunctions)
       <*> customizeFields
         _siCustomization
         (makeTypename <> MkTypename (<> Name.__mutation_backend))
-        (buildMutationFields mkRootFieldName Backend sourceInfo validTables validFunctions)
+        (buildMutationFields noTableFieldsCache mkRootFieldName Backend sourceInfo validTables validFunctions)
       <*> customizeFields
         _siCustomization
         (makeTypename <> MkTypename (<> Name.__subscription))
@@ -773,7 +777,7 @@ buildAllRoleParsersForSchema ::
   (BackendSchema b, MonadError QErr m, MonadIO m) =>
   -- | Persisted memo caches, or 'Nothing' to build cold. 'Nothing' is exactly the
   -- pre-Phase-8 behaviour and is the default; see 'EFPersistentMemoCache'.
-  Maybe MemoStore ->
+  Maybe TableFieldStore ->
   -- | The DB schema this partition covers; part of the memo cache's key.
   SchemaName ->
   SchemaSampledFeatureFlags ->
@@ -784,16 +788,12 @@ buildAllRoleParsersForSchema ::
   [RoleName] ->
   SourceInfo b ->
   m (HashMap RoleName SchemaFieldParsers)
-buildAllRoleParsersForSchema mMemoStore schemaName sampledFeatureFlags schemaOptions sources remotes remoteSchemaPermsCtx roles filteredSi = do
-  -- Per-table content fingerprint plus GQL identifier, computed once for the whole
-  -- pair. The identifier is needed because some memo keys name their table by GQL
-  -- identifier rather than 'TableName' and cannot be mapped back (see
-  -- 'Hasura.GraphQL.Schema.MemoInvalidate'). Only forced when the memo cache is on.
-  tableFingerprints <- case mMemoStore of
-    Nothing -> pure mempty
-    Just _ -> for (_siTables filteredSi) \tableInfo -> do
-      identifier <- getTableIdentifierName @b tableInfo
-      pure (J.toJSON tableInfo, identifier)
+buildAllRoleParsersForSchema mTableFieldStore schemaName sampledFeatureFlags schemaOptions sources remotes remoteSchemaPermsCtx roles filteredSi = do
+  -- Per-table content fingerprints, computed once for the whole pair and only when
+  -- the cache is on. These decide which tables changed; TableDeps expands that into
+  -- the set whose parsers must be rebuilt.
+  let tableFingerprints = J.toJSON <$> _siTables filteredSi
+      dependencyGraph = tableDependencyGraph @b (_siTables filteredSi)
   fmap HashMap.fromList $ for roles $ \role -> do
     let hasuraSchemaContext =
           SchemaContext
@@ -813,20 +813,18 @@ buildAllRoleParsersForSchema mMemoStore schemaName sampledFeatureFlags schemaOpt
     -- 'assembleRelayRoleContext' (see the note on 'SchemaFieldParsers'): its
     -- global 'Node' interface cannot be split across per-schema memoize tables
     -- without producing conflicting type definitions.
-    let buildParsers = buildSchemaRoleParsers hasuraSchemaContext schemaOptions filteredSi
-    hasuraParsers <- case mMemoStore of
-      -- Cold build: a fresh memo table per pass, i.e. every table's parser tree is
-      -- rebuilt. Pre-Phase-8 behaviour.
-      Nothing -> runMemoizeT buildParsers
-      -- Phase 8: seed from the previous build and rebuild only what changed.
-      Just store ->
-        withSchemaMemoCache @b
-          store
-          (_siName filteredSi)
-          schemaName
-          role
-          tableFingerprints
-          buildParsers
+    -- Phase 9: with a store, an unchanged table's builders are never called; the
+    -- cache is consulted above them, so there is no key to compute and no memo
+    -- table to probe. 'Nothing' rebuilds every table (the default).
+    cacher <- case mTableFieldStore of
+      Nothing -> pure noTableFieldsCache
+      Just store -> do
+        let pairKey = (_siName filteredSi, schemaName, role)
+        -- MUST precede any withTableFields call for this pair: it is what drops the
+        -- entries a change invalidated.
+        _stats <- prepareForBuild @b store pairKey dependencyGraph tableFingerprints
+        pure $ mkTableFieldsCacher @b store pairKey
+    hasuraParsers <- runMemoizeT $ buildSchemaRoleParsers cacher hasuraSchemaContext schemaOptions filteredSi
     pure (role, hasuraParsers)
 
 -- | Assemble the per-role Relay 'RoleContext'.
@@ -1112,7 +1110,10 @@ buildRemoteSchemaParser remoteSchemaPermsCtx roleName context = do
 --   subscription field parsers.
 buildQueryAndSubscriptionFields ::
   forall b r m n.
-  (MonadBuildSchema b r m n) =>
+  (MonadBuildSchema b r m n, MonadIO m, Typeable n) =>
+  -- | Phase 9: reuses an unchanged table's fields instead of rebuilding them.
+  -- 'noTableFieldsCache' is the pre-Phase-9 behaviour.
+  TableFieldsCacher b ->
   MkRootFieldName ->
   SourceInfo b ->
   TableCache b ->
@@ -1126,7 +1127,7 @@ buildQueryAndSubscriptionFields ::
       [P.FieldParser n (SubscriptionRootField UnpreparedValue)],
       [(G.Name, Parser 'Output n (ApolloFederationParserFunction n))]
     )
-buildQueryAndSubscriptionFields mkRootFieldName sourceInfo tables (takeExposedAs FEAQuery -> functions) nativeQueries storedProcedures = do
+buildQueryAndSubscriptionFields cacher mkRootFieldName sourceInfo tables (takeExposedAs FEAQuery -> functions) nativeQueries storedProcedures = do
   roleName <- retrieve scRole
   functionPermsCtx <- retrieve Options.soInferFunctionPermissions
   functionSelectExpParsers <-
@@ -1151,9 +1152,12 @@ buildQueryAndSubscriptionFields mkRootFieldName sourceInfo tables (takeExposedAs
   (tableQueryFields, tableSubscriptionFields, apolloFedTableParsers) <-
     unzip3
       . catMaybes
-      <$> for (HashMap.toList tables) \(tableName, tableInfo) -> runMaybeT $ do
-        tableIdentifierName <- getTableIdentifierName @b tableInfo
-        lift $ buildTableQueryAndSubscriptionFields mkRootFieldName tableName tableInfo tableIdentifierName
+      <$> for (HashMap.toList tables) \(tableName, tableInfo) ->
+        -- The cache wraps the whole per-table build, including
+        -- getTableIdentifierName: the point is to skip the walk, not just its tail.
+        runTableFieldsCacher cacher "query" tableName $ runMaybeT $ do
+          tableIdentifierName <- getTableIdentifierName @b tableInfo
+          lift $ buildTableQueryAndSubscriptionFields mkRootFieldName tableName tableInfo tableIdentifierName
 
   let tableQueryRootFields = fmap mkRF $ concat tableQueryFields
       tableSubscriptionRootFields = fmap mkRF $ concat tableSubscriptionFields
@@ -1277,16 +1281,22 @@ buildRelayQueryAndSubscriptionFields mkRootFieldName sourceInfo tables (takeExpo
 
 buildMutationFields ::
   forall b r m n.
-  (MonadBuildSchema b r m n) =>
+  (MonadBuildSchema b r m n, MonadIO m, Typeable n) =>
+  TableFieldsCacher b ->
   MkRootFieldName ->
   Scenario ->
   SourceInfo b ->
   TableCache b ->
   FunctionCache b ->
   SchemaT r m [P.FieldParser n (MutationRootField UnpreparedValue)]
-buildMutationFields mkRootFieldName scenario sourceInfo tables (takeExposedAs FEAMutation -> functions) = do
+buildMutationFields cacher mkRootFieldName scenario sourceInfo tables (takeExposedAs FEAMutation -> functions) = do
   roleName <- retrieve scRole
-  tableMutations <- for (HashMap.toList tables) \(tableName, tableInfo) -> do
+  -- Frontend and Backend produce different fields for the same table, so they must
+  -- not share a cache slot.
+  let mutationSlot = case scenario of
+        Frontend -> "mutation-frontend"
+        Backend -> "mutation-backend"
+  tableMutations <- for (HashMap.toList tables) \(tableName, tableInfo) -> runTableFieldsCacher cacher mutationSlot tableName do
     tableIdentifierName <- getTableIdentifierName @b tableInfo
     inserts <-
       mkRFs (MDBR . MDBInsert) $ buildTableInsertMutationFields mkRootFieldName scenario tableName tableInfo tableIdentifierName

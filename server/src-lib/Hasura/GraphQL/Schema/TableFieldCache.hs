@@ -17,6 +17,11 @@ module Hasura.GraphQL.Schema.TableFieldCache
     newTableFieldStore,
     prepareForBuild,
     withTableFields,
+
+    -- * Passing the cache down to the builders
+    TableFieldsCacher (..),
+    mkTableFieldsCacher,
+    noTableFieldsCache,
   )
 where
 
@@ -174,3 +179,39 @@ withTableFields store pairKey slot tableName build = do
     emptyPairState = PairState mempty mempty
     insertField k v pairState =
       pairState {psFields = HashMap.insert k (toDyn v) (psFields pairState)}
+
+--------------------------------------------------------------------------------
+-- Passing the cache down
+
+-- | A per-table caching wrapper, handed to the field builders.
+--
+-- Rank-2 over both the cached type and the monad: one cacher serves every slot
+-- (query fields and mutation fields have different types), and the builders run in
+-- @SchemaT r m@ while the cacher is constructed in @m@.
+--
+-- Threading this as a value avoids putting the store in @SchemaT@'s reader
+-- environment, which would touch every 'MonadBuildSchema' user.
+newtype TableFieldsCacher b = TableFieldsCacher
+  { -- | @runTableFieldsCacher slot table build@
+    runTableFieldsCacher ::
+      forall a n.
+      (Typeable a, MonadIO n) =>
+      Text ->
+      TableName b ->
+      n a ->
+      n a
+  }
+
+-- | Cache per-table builder output in the store.
+--
+-- Only sound once 'prepareForBuild' has run for this pair — it does no
+-- invalidation of its own.
+mkTableFieldsCacher :: forall b. (Backend b) => TableFieldStore -> PairKey -> TableFieldsCacher b
+mkTableFieldsCacher store pairKey =
+  -- @b@ must be applied explicitly: TableName is a non-injective type family, so
+  -- it cannot be recovered from the argument.
+  TableFieldsCacher \slot tableName build -> withTableFields @_ @b store pairKey slot tableName build
+
+-- | Always rebuild. This is the pre-Phase-9 behaviour and the default.
+noTableFieldsCache :: TableFieldsCacher b
+noTableFieldsCache = TableFieldsCacher \_slot _tableName build -> build

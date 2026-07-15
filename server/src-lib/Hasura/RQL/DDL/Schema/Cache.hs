@@ -51,7 +51,7 @@ import Hasura.Function.Cache
 import Hasura.Function.Metadata (FunctionMetadata (..))
 import Hasura.GraphQL.Context (GQLContext, RoleContext)
 import Hasura.GraphQL.Schema (RoleContextValue, SchemaFieldParsers, assemblePerPairContexts, buildAllRoleParsersForSchema, buildGQLContext, buildSchemaOptions, partitionSourceBySchema)
-import Hasura.GraphQL.Schema.MemoInvalidate (MemoStore, newMemoStore)
+import Hasura.GraphQL.Schema.TableFieldCache (TableFieldStore, newTableFieldStore)
 import Hasura.GraphQL.Schema.Backend (BackendSchema)
 import Hasura.GraphQL.Schema.Common
 import Hasura.GraphQL.Schema.Instances ()
@@ -180,7 +180,7 @@ buildRebuildableSchemaCache logger env disableNativeQueryValidation metadataWith
   -- rebuild driven by 'Inc.rebuildRule' sees the caches left by the previous one.
   -- Rebuilds are serialised by the 'AppStateRef' lock, so a plain IORef is safe.
   -- (A fresh 'RebuildableSchemaCache' starts cold — correct, just slower.)
-  memoStore <- newMemoStore
+  memoStore <- newTableFieldStore
   result <-
     flip runReaderT CatalogSync
       $ Inc.build (buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryContext memoStore) (metadataWithVersion, dynamicConfig, initialInvalidationKeys, Nothing)
@@ -435,10 +435,11 @@ buildSchemaCacheRule ::
   Env.Environment ->
   DisableNativeQueryValidation ->
   Maybe SchemaRegistryContext ->
-  -- | Persisted per-(source, schema, role) memo caches (Phase 8). Created once per
-  -- 'RebuildableSchemaCache' and reused by every rebuild, so parsers can survive
-  -- across metadata changes. Only consulted when 'EFPersistentMemoCache' is on.
-  MemoStore ->
+  -- | Persisted per-(source, schema, role) table field caches (Phase 9). Created
+  -- once per 'RebuildableSchemaCache' and reused by every rebuild, so an unchanged
+  -- table's parsers survive across metadata changes. Only consulted when
+  -- 'EFPersistentMemoCache' is on.
+  TableFieldStore ->
   (MetadataWithResourceVersion, CacheDynamicConfig, InvalidationKeys, Maybe StoredIntrospection)
     `arr` (SchemaCache, (SourcesIntrospectionStatus, SchemaRegistryAction))
 buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryContext memoStore = proc (MetadataWithResourceVersion metadataNoDefaults interimMetadataResourceVersion, dynamicConfig, invalidationKeys, storedIntrospection) -> do
