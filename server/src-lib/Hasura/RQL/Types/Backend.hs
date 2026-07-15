@@ -173,10 +173,6 @@ class
     ToErrorValue (TableName b),
     Typeable (Column b),
     Typeable (ColumnPath b),
-    -- 'ScalarType' is a type family, so this does not follow from @Typeable b@ and
-    -- must be stated. Needed to classify content-keyed memoization nodes during
-    -- Phase 8 eviction; see "Hasura.GraphQL.Schema.MemoInvalidate".
-    Typeable (ScalarType b),
     Typeable b,
     HasTag b,
     Traversable (CountType b),
