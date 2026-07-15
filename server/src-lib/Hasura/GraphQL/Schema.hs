@@ -778,8 +778,12 @@ buildAllRoleParsersForSchema ::
   -- | Persisted memo caches, or 'Nothing' to build cold. 'Nothing' is exactly the
   -- pre-Phase-8 behaviour and is the default; see 'EFPersistentMemoCache'.
   Maybe TableFieldStore ->
-  -- | The DB schema this partition covers; part of the memo cache's key.
+  -- | The DB schema this partition covers; part of the cache's key.
   SchemaName ->
+  -- | Per-table content fingerprints, computed once by the caller and shared with
+  -- the 'Inc.cache' key that gates this build (§10.2). These decide which tables
+  -- changed; 'tableDependencyGraph' expands that into the set to rebuild.
+  HashMap (TableName b) J.Value ->
   SchemaSampledFeatureFlags ->
   SchemaOptions ->
   SourceCache ->
@@ -788,12 +792,8 @@ buildAllRoleParsersForSchema ::
   [RoleName] ->
   SourceInfo b ->
   m (HashMap RoleName SchemaFieldParsers)
-buildAllRoleParsersForSchema mTableFieldStore schemaName sampledFeatureFlags schemaOptions sources remotes remoteSchemaPermsCtx roles filteredSi = do
-  -- Per-table content fingerprints, computed once for the whole pair and only when
-  -- the cache is on. These decide which tables changed; TableDeps expands that into
-  -- the set whose parsers must be rebuilt.
-  let tableFingerprints = J.toJSON <$> _siTables filteredSi
-      dependencyGraph = tableDependencyGraph @b (_siTables filteredSi)
+buildAllRoleParsersForSchema mTableFieldStore schemaName tableFingerprints sampledFeatureFlags schemaOptions sources remotes remoteSchemaPermsCtx roles filteredSi = do
+  let dependencyGraph = tableDependencyGraph @b (_siTables filteredSi)
   fmap HashMap.fromList $ for roles $ \role -> do
     let hasuraSchemaContext =
           SchemaContext

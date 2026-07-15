@@ -20,6 +20,7 @@
 -- exercise no transitive invalidation and would pass a broken evictor.
 module Hasura.GraphQL.Schema.MemoCacheGateSpec (spec) where
 
+import Data.Aeson (toJSON)
 import Data.HashMap.Strict qualified as HashMap
 import Data.Text qualified as T
 import Data.Text.NonEmpty (nonEmptyTextQQ)
@@ -151,6 +152,8 @@ runBuildSdl mStore sourceInfo = do
       buildAllRoleParsersForSchema @PG
         mStore
         (SchemaName "public")
+        -- computed exactly as Cache.hs does, so the gate exercises the real key
+        (toJSON <$> _siTables sourceInfo)
         sampledFlags
         defaultSchemaOptions
         mempty -- SourceCache: no remote relationships in this fixture

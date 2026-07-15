@@ -155,8 +155,32 @@ sloppy: it compared a probe absolute against an A/B baseline. The *ratio* predic
 the first prediction in this project to survive the harness, and the only one that came from measuring the
 intervention rather than reading the code.
 
-**Small-schema regression resolved:** 0.96x–1.07x, versus Phase 8's 0.89x. The residual ~4% on small TRACK is
-the §10.2 double-fingerprint tax with almost no walk to offset it — now clearly worth fixing.
+**Small schemas: neutral (0.96x–1.07x).** ⚠ An earlier draft called this "regression resolved" versus Phase
+8's 0.89x. That was **over-reading noise**: across three runs small ops sit at 0.96x–1.07x both before and
+after the §10.2 fix, and 5 reps of a ~0.3s operation cannot resolve a 4% effect. There was never a
+small-schema regression to resolve; Phase 8's 0.89x was most likely the same noise.
+
+**⚠ Read the flag-ON time, not the speedup.** Across three A/B runs the baseline for large TRACK has been
+1.480 / 1.493 / 1.313 (±15%), while the flag-ON time has been 0.465 / 0.468. **The stable measured fact is
+"large TRACK costs ~0.46s with the cache on"**; the ratio inherits the baseline's drift. Phase 9 is ~2.8–3.2x
+depending on which baseline you draw against. Quoting "3.21x" as *the* number is over-precise.
+
+**§10.2 (double fingerprint) — FIXED, and it changed nothing measurable.** `schemaContentKey` now computes
+the per-table `toJSON` once and shares it with the per-table cache instead of each computing its own.
+Flag-ON times before/after: TRACK large 0.465 → 0.468, UNTRACK 0.483 → 0.455, ALTER ADD 0.724 → 0.743 — all
+noise. The duplicated work was real but cheap *on this fixture*, whose tables are `tbl_N` with a handful of
+columns. Real `app_test` (`sys`) tables are wider and it may matter more there, but that is unmeasured and
+should not be claimed. The fix is kept because it removes genuine duplicated work, not because it bought
+anything here.
+
+Still not done: the fingerprint's `sortOn encode` — serialising every table's `Value` to a `ByteString` only
+to get a deterministic order — is plausibly the more expensive half. It could be dropped by keying an
+`Object` on `toTxt tableName` (aeson's `KeyMap` `Eq` is order-independent). **Deliberately not done:** in
+`TableFieldCache` a `toTxt` collision causes over-invalidation (safe), but in `schemaContentKey` it would
+merge two tables under one key, last-write-wins, and a change to the shadowed table would **not move the
+key** — under-detection, i.e. a silently stale schema. Within a partition all tables share a schema and
+names are unique, so it cannot collide; but that invariant should be established rather than assumed before
+trading it for an unmeasured gain.
 
 **§5.3 confirmed under load:** no "conflicting definitions" errors in the engine log across the full A/B, so
 rebuilt tables minting fresh shared types do coexist with reused ones. `collectTypeDefinitions` comparing

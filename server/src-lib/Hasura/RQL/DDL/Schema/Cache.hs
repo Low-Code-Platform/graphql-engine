@@ -643,9 +643,18 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
                                     -- key-class-free fingerprint.
                                     fingerprintCache :: (ToJSON v) => HashMap.HashMap k v -> Value
                                     fingerprintCache = toJSON . sortOn encode . map toJSON . HashMap.elems
+                                    -- Per-table fingerprints, computed ONCE and shared: this key needs
+                                    -- them, and so does the Phase 9 per-table field cache, which decides
+                                    -- from them which tables changed. Computing 'toJSON' over every
+                                    -- TableInfo twice was O(total) duplicated work on every build
+                                    -- (rfcs/phase9-per-table-field-cache.md, and §10.2 of the Phase 8 RFC).
+                                    tableFingerprints :: HashMap.HashMap (TableName b) Value
+                                    tableFingerprints = toJSON <$> _siTables filteredSi
                                     schemaContentKey =
                                       toJSON
-                                        [ fingerprintCache (_siTables filteredSi),
+                                        [ -- same shape fingerprintCache would produce, reusing the
+                                          -- fingerprints above rather than recomputing them
+                                          toJSON (sortOn encode (HashMap.elems tableFingerprints)),
                                           fingerprintCache (_siFunctions filteredSi),
                                           fingerprintCache (_siNativeQueries filteredSi),
                                           fingerprintCache (_siStoredProcedures filteredSi),
@@ -660,7 +669,7 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
                                     -<
                                       KeyedBy
                                         effectiveKey
-                                        (schemaName, sff', schemaOptions', sources', remoteSchemaCtxs', remoteSchemaPermsCtx', allRoles', filteredSi)
+                                        (schemaName, tableFingerprints, sff', schemaOptions', sources', remoteSchemaCtxs', remoteSchemaPermsCtx', allRoles', filteredSi)
                                 -- §5.3 "where the win is": assemble this pair's per-role 'GQLContext'
                                 -- right here, behind the SAME per-(source, schema) 'Inc.cache' key as its
                                 -- parsers, so a mutation to one pair re-assembles only that pair. Keyed on
@@ -1122,6 +1131,7 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
         -- dynamic schema-build config)
         (Value, Inc.InvalidationKey, [RoleName], CacheDynamicConfig)
         ( SchemaName,
+          HashMap (TableName b) Value,
           SchemaSampledFeatureFlags,
           Options.SchemaOptions,
           SourceCache,
@@ -1132,7 +1142,7 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
         )
         `arr` HashMap RoleName SchemaFieldParsers
     buildSchemaParsersForSchema = Inc.cache proc
-      (KeyedBy (_, _, _, dynConfig) (schemaName, sampledFeatureFlags, schemaOptions, sources, remotes, remoteSchemaPermsCtx, roles, filteredSi)) -> do
+      (KeyedBy (_, _, _, dynConfig) (schemaName, tableFingerprints, sampledFeatureFlags, schemaOptions, sources, remotes, remoteSchemaPermsCtx, roles, filteredSi)) -> do
         -- 'memoStore' is a parameter of 'buildSchemaCacheRule', so it is in scope
         -- here and does not need threading through the arrow. Passing 'Nothing'
         -- yields the pre-Phase-8 cold build.
@@ -1140,7 +1150,7 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
               if EFPersistentMemoCache `HS.member` _cdcExperimentalFeatures dynConfig
                 then Just memoStore
                 else Nothing
-        bindA -< buildAllRoleParsersForSchema mMemoStore schemaName sampledFeatureFlags schemaOptions sources remotes remoteSchemaPermsCtx roles filteredSi
+        bindA -< buildAllRoleParsersForSchema mMemoStore schemaName tableFingerprints sampledFeatureFlags schemaOptions sources remotes remoteSchemaPermsCtx roles filteredSi
 
     -- §5.3: per-(source, DB schema) assembly of the per-role 'GQLContext',
     -- 'Inc.cache'd under the SAME 'effectiveKey' as the pair's parsers. This is
