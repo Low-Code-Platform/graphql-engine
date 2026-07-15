@@ -118,21 +118,21 @@ data ExperimentalFeature
     -- actually use the @/v1beta1/relay@ endpoint must opt in with this feature.
     -- See @rfcs/per-schema-gql-context.md@ §12.11–§12.13.
     EFEnableRelaySchema
-  | -- | Reuse memoized GraphQL parsers across schema-cache builds instead of
-    -- rebuilding every table's parser tree on every metadata change.
+  | -- | Turn OFF the per-table GraphQL schema cache.
     --
-    -- A mutation scoped to one table currently rebuilds every table in that DB
-    -- schema; on a 600-table schema that is ~1.1s of the ~1.5s mutation, ~599
-    -- tables of which did not change. With this on, unchanged parsers are seeded
-    -- from the previous build and only the changed table's subtree (plus anything
-    -- transitively embedding it) is rebuilt.
+    -- The cache is ON by default. It reuses an unchanged table's field parsers
+    -- across schema-cache builds, so a mutation scoped to one table no longer
+    -- rebuilds every table in that DB schema. Measured on a 600-table schema:
+    -- track/untrack drop from ~1.4s to ~0.46s.
     --
-    -- __Off by default while the eviction classifier is being validated.__ A
-    -- classifier that fails to recognise a memo key shape would reuse a stale
-    -- parser and silently serve a stale schema, so this stays opt-in until the
-    -- byte-identical-SDL gate lands (@rfcs/phase8-persistent-memo-cache.md@ §8,
-    -- Stage 2d).
-    EFPersistentMemoCache
+    -- This is an escape hatch. The cache reuses a table's parsers unless the
+    -- table changed or it embeds one that did (see
+    -- "Hasura.GraphQL.Schema.TableDeps"); if that dependency analysis were ever
+    -- to under-reach, the served schema would be stale with no other symptom.
+    -- Setting this restores the unconditional rebuild.
+    --
+    -- See @rfcs/phase9-per-table-field-cache.md@.
+    EFDisablePerTableSchemaCache
   deriving (Bounded, Enum, Eq, Generic, Show)
 
 experimentalFeatureKey :: ExperimentalFeature -> Text
@@ -151,7 +151,7 @@ experimentalFeatureKey = \case
   EFNoNullUnboundVariableDefault -> "no_null_unbound_variable_default"
   EFRemoveEmptySubscriptionResponses -> "remove_empty_subscription_responses"
   EFEnableRelaySchema -> "enable_relay_schema"
-  EFPersistentMemoCache -> "persistent_memo_cache"
+  EFDisablePerTableSchemaCache -> "disable_per_table_schema_cache"
 
 instance Hashable ExperimentalFeature
 

@@ -775,8 +775,9 @@ buildSchemaRelayParsers relaySchemaContext schemaOptions sourceInfo@(SourceInfo 
 buildAllRoleParsersForSchema ::
   forall b m.
   (BackendSchema b, MonadError QErr m, MonadIO m) =>
-  -- | Persisted memo caches, or 'Nothing' to build cold. 'Nothing' is exactly the
-  -- pre-Phase-8 behaviour and is the default; see 'EFPersistentMemoCache'.
+  -- | Per-table field caches, or 'Nothing' to rebuild every table unconditionally.
+  -- Populated by default; 'Nothing' is the 'EFDisablePerTableSchemaCache' escape
+  -- hatch and the pre-Phase-9 behaviour.
   Maybe TableFieldStore ->
   -- | The DB schema this partition covers; part of the cache's key.
   SchemaName ->

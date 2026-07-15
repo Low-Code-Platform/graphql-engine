@@ -438,7 +438,7 @@ buildSchemaCacheRule ::
   -- | Persisted per-(source, schema, role) table field caches (Phase 9). Created
   -- once per 'RebuildableSchemaCache' and reused by every rebuild, so an unchanged
   -- table's parsers survive across metadata changes. Only consulted when
-  -- 'EFPersistentMemoCache' is on.
+  -- the per-table schema cache is enabled (the default).
   TableFieldStore ->
   (MetadataWithResourceVersion, CacheDynamicConfig, InvalidationKeys, Maybe StoredIntrospection)
     `arr` (SchemaCache, (SourcesIntrospectionStatus, SchemaRegistryAction))
@@ -1144,12 +1144,12 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
     buildSchemaParsersForSchema = Inc.cache proc
       (KeyedBy (_, _, _, dynConfig) (schemaName, tableFingerprints, sampledFeatureFlags, schemaOptions, sources, remotes, remoteSchemaPermsCtx, roles, filteredSi)) -> do
         -- 'memoStore' is a parameter of 'buildSchemaCacheRule', so it is in scope
-        -- here and does not need threading through the arrow. Passing 'Nothing'
-        -- yields the pre-Phase-8 cold build.
+        -- here and does not need threading through the arrow. ON by default;
+        -- 'Nothing' restores the unconditional per-table rebuild.
         let mMemoStore =
-              if EFPersistentMemoCache `HS.member` _cdcExperimentalFeatures dynConfig
-                then Just memoStore
-                else Nothing
+              if EFDisablePerTableSchemaCache `HS.member` _cdcExperimentalFeatures dynConfig
+                then Nothing
+                else Just memoStore
         bindA -< buildAllRoleParsersForSchema mMemoStore schemaName tableFingerprints sampledFeatureFlags schemaOptions sources remotes remoteSchemaPermsCtx roles filteredSi
 
     -- §5.3: per-(source, DB schema) assembly of the per-role 'GQLContext',

@@ -200,6 +200,25 @@ The small-schema regression (Phase 8: 0.89x-0.98x) should also disappear, since 
 fingerprint replaces rather than adds to the walk. §10.2 of Phase 8's RFC (collapsing `schemaContentKey`
 with the per-table fingerprints) remains open and would help here.
 
+## 7.2 Shipped ON by default (2026-07-16)
+
+The flag is now an **opt-out**: `EFDisablePerTableSchemaCache` (key `disable_per_table_schema_cache`),
+following the existing `EFHideStreamFields` / `EFDisablePostgresArrays` precedent rather than
+`EFEnableRelaySchema`'s opt-in. Defaulting on required the opt-out form anyway, which also retires the old
+name — `persistent_memo_cache` described Phase 8's design, which no longer exists.
+
+**Verified by the startup log, not by inference** — inverting a boolean is exactly the change that compiles,
+passes 1281 tests (nothing in the suite exercises flag plumbing), and is silently wrong:
+
+| arm | `experimental_features` | large TRACK |
+|---|---|--:|
+| default | `[]` | **0.467s** |
+| opt-out | `["disable_per_table_schema_cache"]` | 1.300s |
+
+Large TRACK with the cache on, across four independent A/B runs: **0.465 / 0.468 / 0.468 / 0.467**. Stable to
+a millisecond, while the baseline it divides drifts ±15% — which is why §7 says to quote the flag-ON time,
+not the ratio.
+
 ## 8. Correctness gate
 
 Unchanged from Phase 8 §8, and non-negotiable: **build twice — incrementally and cold — and assert
@@ -219,7 +238,7 @@ asymmetric — when in doubt, rebuild.
 |---|---|---|
 | **9a** | Table→table relationship graph + `invalidatedTables`, with unit tests | reverse reachability, cycles terminate |
 | **9b** | `Dynamic` per-table store + `withTableFieldsCache` wrapper | round-trip; `fromDynamic` failure ⇒ miss |
-| **9c** | Thread the wrapper into both loops, behind `EFPersistentMemoCache` (reuse the flag), OFF by default | SDL gate green + **sabotage check** |
+| **9c** | Thread the wrapper into both loops, behind a flag, OFF by default | SDL gate green + **sabotage check** |
 | **9d** | A/B vs baseline **and** vs Phase 8 | is it actually ~2x? |
 | **9e** | Delete Phase 8's machinery (§6) | tests green, A/B unchanged |
 
