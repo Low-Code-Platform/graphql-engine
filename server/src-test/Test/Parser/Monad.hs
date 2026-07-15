@@ -6,6 +6,7 @@ module Test.Parser.Monad
   ( ParserTest (..),
     SchemaEnvironment (..),
     SchemaTest,
+    defaultSchemaOptions,
     runSchemaTest,
     notImplementedYet,
   )

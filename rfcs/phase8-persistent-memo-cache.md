@@ -488,7 +488,25 @@ in `Cache.hs`; the SDL-equality gate is not built.
   - **Known cost, not yet addressed:** `withSchemaMemoCache` computes `toJSON` per table, *in addition to*
     the existing `schemaContentKey` whole-pair fingerprint (§10.2) — so the flag currently doubles that
     O(total) work. Fixing §10.2 should replace both with one per-table fingerprint set.
-- ⬜ **2d — the SDL-equality gate** (§8). Land *before* 2c is enabled by default.
+- ✅ **2d — the SDL-equality gate. DONE 2026-07-15.**
+  `src-test/Hasura/GraphQL/Schema/MemoCacheGateSpec.hs`, 4 examples. Builds a fixture schema twice —
+  incrementally (seeded + evicted) and cold (from `mempty`) — and asserts **identical SDL**.
+  - Goes through `assemblePerPairContexts`, i.e. the same call the engine makes, and compares
+    `RoleContextValue`'s `G.SchemaIntrospection` rendered by `generateSDL`. So the SDL compared is the SDL a
+    client would actually receive, not a hand-rolled approximation.
+  - **The fixture has a relationship on purpose** (`album` 1—* `track`). `album`'s selection set embeds
+    `track`'s, and `album`'s key does *not* change when `track` does — so only reverse reachability can save
+    it. Production metadata (28 relationships / 653 tables, §9) would exercise none of this.
+  - **Verified the gate can fail.** Sabotaging the classifier to never evict (`invalidatedByTables _ _ _ =
+    False`) makes 2 of the 4 examples fail with exactly the real failure mode: the incremental build's
+    `track` type is missing `duration: Int!`. A differential test that cannot fail is theatre; this one was
+    checked.
+  - Caveat: "reverting a change also reverts the SDL" passes even under sabotage, because the stale state
+    coincidentally equals the reverted schema. Kept for coverage, not relied on.
+  - Needed `defaultSchemaOptions` exported from `Test.Parser.Monad`.
+  - **Note:** `Test.Parser.Monad`'s existing harness cannot test any of this — its `MonadMemoize
+    SchemaTestInternal` instance is `memoizeOn _ _ = id`, i.e. memoization stubbed out entirely. The gate
+    drives `buildAllRoleParsersForSchema` over `ExceptT QErr IO` instead.
 - ⬜ **2e — relationship-heavy fixture** (§12 note) + bench.
 
 **Order matters: 2d before 2c ships.** 2a's unit tests prove `evictWith`'s *mechanics*; they say nothing
