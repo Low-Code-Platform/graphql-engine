@@ -132,7 +132,37 @@ gate is what verifies it, and it must pass before the flag defaults on.
 
 Net: **less code than today**, and no existential key casting.
 
-## 7. Expectation
+## 7. Result — MEASURED 2026-07-15 (Stage 9d): **3.21x**
+
+Full A/B, fresh non-profiled engines, 5 reps, same fixture and harness Phase 8 was measured on:
+
+| operation | size | baseline | **Phase 9** | speedup | (Phase 8 was) |
+|---|---|--:|--:|--:|--:|
+| **TRACK** | large (600) | 1.493 | **0.465** | **3.21x** | 1.31x |
+| **UNTRACK** | large | 1.412 | **0.483** | **2.92x** | 1.30x |
+| ALTER ADD | large | 1.658 | **0.724** | 2.29x | 1.29x |
+| ALTER DROP | large | 1.676 | **0.764** | 2.19x | 1.27x |
+| TRACK | medium (200) | 0.712 | 0.347 | 2.05x | 1.21x |
+| UNTRACK | medium | 0.682 | 0.377 | 1.81x | 1.14x |
+| TRACK | small (2) | 0.360 | 0.376 | 0.96x | 1.15x |
+| UNTRACK | small | 0.320 | 0.321 | 1.00x | 0.98x |
+
+**~2.5x better than Phase 8, from less code.**
+
+**The §2 ablation was accurate.** It put the walk-free build at 0.976s on the probe; probe absolutes run ~0.5s
+above A/B averages, which lands at ~0.47s — measured **0.465s**. (§7.1's "~2x" below was arithmetically
+sloppy: it compared a probe absolute against an A/B baseline. The *ratio* prediction held exactly.) This is
+the first prediction in this project to survive the harness, and the only one that came from measuring the
+intervention rather than reading the code.
+
+**Small-schema regression resolved:** 0.96x–1.07x, versus Phase 8's 0.89x. The residual ~4% on small TRACK is
+the §10.2 double-fingerprint tax with almost no walk to offset it — now clearly worth fixing.
+
+**§5.3 confirmed under load:** no "conflicting definitions" errors in the engine log across the full A/B, so
+rebuilt tables minting fresh shared types do coexist with reused ones. `collectTypeDefinitions` comparing
+structurally rather than by `Unique` holds in practice, not just in the unit gate.
+
+### 7.1 Original (pre-measurement) expectation — retained for the record
 
 Projected from §2: skipping the walk removes ~0.675s of a ~1.65s track ⇒ **~2x**, versus Phase 8's 1.31x.
 A real cache skips 600 of 601 tables, so ~99.8% of that.
