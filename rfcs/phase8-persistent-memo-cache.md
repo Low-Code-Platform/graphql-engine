@@ -298,6 +298,49 @@ whole-pair `Value` (see §10.2, which may make this cheaper *and* fix an existin
 
 ## 7. Performance expectation
 
+> # ⛔ MEASURED 2026-07-15 (Stage 2e): **~1.30x, not 4.7x. The prediction below was wrong.**
+>
+> Full A/B, fresh non-profiled engines, 5 reps, s1..s5 fixture (`s5` = 600 tables):
+>
+> | operation | size | OFF | ON | speedup |
+> |---|---|--:|--:|--:|
+> | TRACK | large | 1.513 | **1.153** | **1.31x** |
+> | UNTRACK | large | 1.437 | **1.103** | **1.30x** |
+> | ALTER ADD | large | 1.694 | **1.309** | 1.29x |
+> | ALTER DROP | large | 1.683 | **1.326** | 1.27x |
+> | TRACK | medium | 0.705 | 0.582 | 1.21x |
+> | TRACK | small | 0.404 | 0.350 | 1.15x |
+> | UNTRACK | small | 0.322 | 0.328 | **0.98x** |
+> | ALTER DROP | small | 0.577 | 0.645 | **0.89x** |
+>
+> **This is the design's ceiling, not a tuning gap.** Runtime probes confirm the cache works perfectly:
+> `changedTables=1 seededNodes=8495 direct=0 evicted=0 survived=8495`, and **zero** unclassified key shapes.
+> 100% of reusable parsers are reused. There is no further eviction win available.
+>
+> **Why the prediction was wrong — the cost model was.** §1's fit, `T ≈ 0.31s + 1.94ms/table`, attributed the
+> *entire* per-table slope to parser construction. Measured: large TRACK saves 0.36s of a ~1.17s per-table
+> cost, so parsers are only **~31%** of it (~0.6ms/table). The other ~1.35ms/table is
+> **`assembleSchemaContextForSchema`** — a *separate* `Inc.cache` node keyed on the same `effectiveKey`. A
+> single-table track moves that key, so the pair's entire introspection is reassembled (`safeSelectionSet` +
+> `parseBuildIntrospectionSchema` over all 601 tables). Phase 8 never touches it. It is the same O(total) step
+> `per-schema-gql-context.md` §2 identified as "the expensive, non-incremental step".
+>
+> The small-schema regressions (0.89x / 0.98x) corroborate: with no parser win to offset it, the §10.2
+> double-fingerprint tax makes the flag a *net loss* on small schemas.
+>
+> **Stage 0 failed to catch this, and that is the process lesson.** It measured *survival rate* (99.82%) and
+> that was reported as validating the *speedup*. Survival only bounds how much of the **parser cache** is
+> reusable; it is silent on whether parser construction dominates the mutation. The gate could not have
+> detected this because it measured the wrong quantity. **A gate must measure the thing being predicted.** One
+> timed probe splitting parser-build from context-assembly would have shown 4.7x was unreachable before
+> Stages 1-2c were written.
+>
+> **To actually get the rest**, `assembleSchemaContextForSchema` must become incremental too — i.e. per-table
+> introspection assembly, not just per-table parsers. That is a strictly larger problem than this RFC (the
+> introspection universe is validated globally for conflicts), and it is what Phase 7 was originally aimed at.
+
+### 7.1 Original (pre-measurement) prediction — retained for the record, now known wrong
+
 With perfect per-table granularity, a one-table track in `s5`:
 
 ```

@@ -784,7 +784,16 @@ buildAllRoleParsersForSchema ::
   [RoleName] ->
   SourceInfo b ->
   m (HashMap RoleName SchemaFieldParsers)
-buildAllRoleParsersForSchema mMemoStore schemaName sampledFeatureFlags schemaOptions sources remotes remoteSchemaPermsCtx roles filteredSi =
+buildAllRoleParsersForSchema mMemoStore schemaName sampledFeatureFlags schemaOptions sources remotes remoteSchemaPermsCtx roles filteredSi = do
+  -- Per-table content fingerprint plus GQL identifier, computed once for the whole
+  -- pair. The identifier is needed because some memo keys name their table by GQL
+  -- identifier rather than 'TableName' and cannot be mapped back (see
+  -- 'Hasura.GraphQL.Schema.MemoInvalidate'). Only forced when the memo cache is on.
+  tableFingerprints <- case mMemoStore of
+    Nothing -> pure mempty
+    Just _ -> for (_siTables filteredSi) \tableInfo -> do
+      identifier <- getTableIdentifierName @b tableInfo
+      pure (J.toJSON tableInfo, identifier)
   fmap HashMap.fromList $ for roles $ \role -> do
     let hasuraSchemaContext =
           SchemaContext
@@ -816,7 +825,7 @@ buildAllRoleParsersForSchema mMemoStore schemaName sampledFeatureFlags schemaOpt
           (_siName filteredSi)
           schemaName
           role
-          (J.toJSON <$> _siTables filteredSi)
+          tableFingerprints
           buildParsers
     pure (role, hasuraParsers)
 

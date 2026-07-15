@@ -56,7 +56,8 @@ buildAllShapes = do
   void $ memoizeOn 'buildAllShapes (G.unsafeMkName "some_logical_model") (pure (7 :: Int))
 
 evictUsers :: MemoCache -> (MemoCache, EvictionStats)
-evictUsers = evictTables @PG src (HS.singleton (tbl "users"))
+-- no GQL-identifier-keyed nodes in this fixture, so the changed-identifier set is empty
+evictUsers = evictTables @PG src (HS.singleton (tbl "users")) HS.empty
 
 spec :: Spec
 spec = describe "memo key classification" do
@@ -91,7 +92,7 @@ spec = describe "memo key classification" do
 
   it "evicts nothing when the changed set is empty" do
     (_, cache) <- runMemoizeTWith emptyMemoCache buildAllShapes
-    let (_, stats) = evictTables @PG src HS.empty cache
+    let (_, stats) = evictTables @PG src HS.empty HS.empty cache
     -- only the unclassifiable node goes; every table-keyed node is retained
     esDirect stats `shouldBe` 1
     esSurvived stats `shouldBe` 6

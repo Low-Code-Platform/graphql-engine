@@ -24,12 +24,13 @@ import Data.Aeson (Value)
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet qualified as HS
 import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
+import Data.Text.Casing (GQLNameIdentifier)
 import Data.Text.Extended (toTxt)
 import Hasura.Authentication.Role (RoleName)
 import Hasura.Backends.Postgres.SQL.Types (SchemaName)
 import Hasura.Prelude
 import Hasura.RQL.Types.Backend (Backend, ScalarType, TableName)
-import Hasura.RQL.Types.Column (ColumnInfo, ColumnType)
+import Hasura.RQL.Types.Column (ColumnInfo, ColumnType, StructuredColumnInfo)
 import Hasura.RQL.Types.Common (SourceName)
 import Language.GraphQL.Draft.Syntax qualified as G
 
@@ -77,19 +78,31 @@ invalidatedByTables ::
   (Backend b) =>
   SourceName ->
   HashSet (TableName b) ->
+  -- | GQL identifiers of the changed tables. Some memo keys name a table by its
+  -- GraphQL identifier rather than its 'TableName', and cannot be mapped back.
+  HashSet GQLNameIdentifier ->
   MemoizationKey t ->
   Bool
-invalidatedByTables sourceName changed key
+invalidatedByTables sourceName changed changedIdents key
   -- (1) Keyed on a table: evict iff that table changed.
   | Just (s, tbl) <- memoKeyArg @(SourceName, TableName b) key =
       s == sourceName && tbl `HS.member` changed
   | Just (s, tbl, _ :: G.Name) <- memoKeyArg @(SourceName, TableName b, G.Name) key =
       s == sourceName && tbl `HS.member` changed
+  -- 'streamColumnValueParser' (SubscriptionStream.hs:139) names its table by GQL
+  -- identifier and carries no content, so it must be evicted when that table
+  -- changes -- but it cannot be matched by TableName.
+  | Just (s, ident) <- memoKeyArg @(SourceName, GQLNameIdentifier) key =
+      s == sourceName && ident `HS.member` changedIdents
   -- (2) Keyed on content: self-invalidating, always reusable.
   | isJust (memoKeyArg @(ScalarType b, G.Nullability) key) = False
   | isJust (memoKeyArg @(ColumnType b, G.Nullability) key) = False
   | isJust (memoKeyArg @(ColumnType b) key) = False
   | isJust (memoKeyArg @(Text, ColumnInfo b) key) = False
+  -- 'tableSelectColumnsEnum' (Schema/Table.hs:125) keys on
+  -- @(enumName, description, columns)@ — the columns are IN the key, so it is
+  -- self-invalidating like the rest of class 2.
+  | isJust (memoKeyArg @(G.Name, Maybe G.Description, [StructuredColumnInfo b]) key) = False
   -- (3) Unclassifiable: evict. See Note [Memo key classification].
   | otherwise = True
 
@@ -100,9 +113,11 @@ evictTables ::
   (Backend b) =>
   SourceName ->
   HashSet (TableName b) ->
+  HashSet GQLNameIdentifier ->
   MemoCache ->
   (MemoCache, EvictionStats)
-evictTables sourceName changed = evictWith (invalidatedByTables @b sourceName changed)
+evictTables sourceName changed changedIdents =
+  evictWith (invalidatedByTables @b sourceName changed changedIdents)
 
 --------------------------------------------------------------------------------
 -- Persisted caches
@@ -153,20 +168,27 @@ withSchemaMemoCache ::
   SourceName ->
   SchemaName ->
   RoleName ->
-  HashMap (TableName b) Value ->
+  -- | Per-table content fingerprint and GQL identifier for this (source, schema).
+  HashMap (TableName b) (Value, GQLNameIdentifier) ->
   MemoizeT m a ->
   m a
-withSchemaMemoCache store sourceName schemaName roleName currentFingerprints action = do
+withSchemaMemoCache store sourceName schemaName roleName currentTables action = do
   previous <- liftIO $ HashMap.lookup storeKey <$> readIORef store
   let storedFingerprints = maybe mempty smsFingerprints previous
       seeded = maybe emptyMemoCache smsCache previous
       changed =
         HS.fromList
           [ tableName
-            | (tableName, fingerprint) <- HashMap.toList currentFingerprints,
+            | (tableName, (fingerprint, _)) <- HashMap.toList currentTables,
               HashMap.lookup (toTxt tableName) storedFingerprints /= Just fingerprint
           ]
-      (evicted, _stats) = evictTables @b sourceName changed seeded
+      changedIdents =
+        HS.fromList
+          [ ident
+            | (tableName, (_, ident)) <- HashMap.toList currentTables,
+              tableName `HS.member` changed
+          ]
+      (evicted, _stats) = evictTables @b sourceName changed changedIdents seeded
   (result, cache') <- runMemoizeTWith evicted action
   liftIO
     $ modifyIORef' store
@@ -176,4 +198,4 @@ withSchemaMemoCache store sourceName schemaName roleName currentFingerprints act
     storeKey = (sourceName, schemaName, roleName)
     freshFingerprints =
       HashMap.fromList
-        [(toTxt tableName, fingerprint) | (tableName, fingerprint) <- HashMap.toList currentFingerprints]
+        [(toTxt tableName, fingerprint) | (tableName, (fingerprint, _)) <- HashMap.toList currentTables]
