@@ -40,6 +40,7 @@ import Hasura.GraphQL.Schema.Backend
 import Hasura.GraphQL.Schema.Common
 import Hasura.GraphQL.Schema.Instances ()
 import Hasura.GraphQL.Schema.Introspect
+import Hasura.GraphQL.Schema.MemoInvalidate (MemoStore, withSchemaMemoCache)
 import Hasura.GraphQL.Schema.Parser
   ( FieldParser,
     Kind (..),
@@ -770,6 +771,11 @@ buildSchemaRelayParsers relaySchemaContext schemaOptions sourceInfo@(SourceInfo 
 buildAllRoleParsersForSchema ::
   forall b m.
   (BackendSchema b, MonadError QErr m, MonadIO m) =>
+  -- | Persisted memo caches, or 'Nothing' to build cold. 'Nothing' is exactly the
+  -- pre-Phase-8 behaviour and is the default; see 'EFPersistentMemoCache'.
+  Maybe MemoStore ->
+  -- | The DB schema this partition covers; part of the memo cache's key.
+  SchemaName ->
   SchemaSampledFeatureFlags ->
   SchemaOptions ->
   SourceCache ->
@@ -778,7 +784,7 @@ buildAllRoleParsersForSchema ::
   [RoleName] ->
   SourceInfo b ->
   m (HashMap RoleName SchemaFieldParsers)
-buildAllRoleParsersForSchema sampledFeatureFlags schemaOptions sources remotes remoteSchemaPermsCtx roles filteredSi =
+buildAllRoleParsersForSchema mMemoStore schemaName sampledFeatureFlags schemaOptions sources remotes remoteSchemaPermsCtx roles filteredSi =
   fmap HashMap.fromList $ for roles $ \role -> do
     let hasuraSchemaContext =
           SchemaContext
@@ -798,7 +804,20 @@ buildAllRoleParsersForSchema sampledFeatureFlags schemaOptions sources remotes r
     -- 'assembleRelayRoleContext' (see the note on 'SchemaFieldParsers'): its
     -- global 'Node' interface cannot be split across per-schema memoize tables
     -- without producing conflicting type definitions.
-    hasuraParsers <- runMemoizeT $ buildSchemaRoleParsers hasuraSchemaContext schemaOptions filteredSi
+    let buildParsers = buildSchemaRoleParsers hasuraSchemaContext schemaOptions filteredSi
+    hasuraParsers <- case mMemoStore of
+      -- Cold build: a fresh memo table per pass, i.e. every table's parser tree is
+      -- rebuilt. Pre-Phase-8 behaviour.
+      Nothing -> runMemoizeT buildParsers
+      -- Phase 8: seed from the previous build and rebuild only what changed.
+      Just store ->
+        withSchemaMemoCache @b
+          store
+          (_siName filteredSi)
+          schemaName
+          role
+          (J.toJSON <$> _siTables filteredSi)
+          buildParsers
     pure (role, hasuraParsers)
 
 -- | Assemble the per-role Relay 'RoleContext'.

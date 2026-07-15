@@ -9,12 +9,24 @@
 module Hasura.GraphQL.Schema.MemoInvalidate
   ( invalidatedByTables,
     evictTables,
+
+    -- * Persisted per-(source, schema, role) caches
+    MemoStore,
+    MemoStoreKey,
+    SchemaMemoState (..),
+    newMemoStore,
+    withSchemaMemoCache,
   )
 where
 
 import Control.Monad.Memoize
+import Data.Aeson (Value)
+import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet qualified as HS
-import Data.Typeable (Typeable)
+import Data.IORef (IORef, modifyIORef', newIORef, readIORef)
+import Data.Text.Extended (toTxt)
+import Hasura.Authentication.Role (RoleName)
+import Hasura.Backends.Postgres.SQL.Types (SchemaName)
 import Hasura.Prelude
 import Hasura.RQL.Types.Backend (Backend, ScalarType, TableName)
 import Hasura.RQL.Types.Column (ColumnInfo, ColumnType)
@@ -60,13 +72,9 @@ class 3 and stays correct — it just stops being fast.
 -- Returning 'False' asserts the node is *provably* unaffected and may be reused
 -- verbatim. Anything unrecognised returns 'True'. See
 -- Note [Memo key classification].
---
--- The extra @Typeable (ScalarType b)@ is not redundant: 'ScalarType' is a type
--- family, so its 'Typeable' instance does not follow from @Typeable b@. @TableName
--- b@, @ColumnType b@ and @ColumnInfo b@ are already covered by 'Backend'.
 invalidatedByTables ::
   forall b t.
-  (Backend b, Typeable (ScalarType b)) =>
+  (Backend b) =>
   SourceName ->
   HashSet (TableName b) ->
   MemoizationKey t ->
@@ -89,9 +97,83 @@ invalidatedByTables sourceName changed key
 -- transitively embedding one.
 evictTables ::
   forall b.
-  (Backend b, Typeable (ScalarType b)) =>
+  (Backend b) =>
   SourceName ->
   HashSet (TableName b) ->
   MemoCache ->
   (MemoCache, EvictionStats)
 evictTables sourceName changed = evictWith (invalidatedByTables @b sourceName changed)
+
+--------------------------------------------------------------------------------
+-- Persisted caches
+
+-- | Identifies one persisted memo cache.
+--
+-- The 'RoleName' dimension is defensive. This deployment is admin-only, so there
+-- is exactly one role and the dimension is inert (locked decision 1). But seeding
+-- one role's build from another role's cache would reuse parsers built under
+-- different permissions — a stale-schema bug that is invisible at @roles = 1@ and
+-- would surface the day a role is added. Keying it out costs a tuple field.
+type MemoStoreKey = (SourceName, SchemaName, RoleName)
+
+-- | Memo caches surviving across schema-cache builds.
+--
+-- A plain 'IORef' is sufficient: schema-cache builds are serialised by the
+-- 'AppStateRef' lock (@withSchemaCacheReadUpdate@ runs the whole build under
+-- @withMVarMasked@), so there is never concurrent access. This is deliberately a
+-- side-channel that 'Inc.cache' does not manage — see the RFC §6.4.
+type MemoStore = IORef (HashMap MemoStoreKey SchemaMemoState)
+
+data SchemaMemoState = SchemaMemoState
+  { -- | Per-table content fingerprints from the previous build, keyed by the
+    -- table's 'toTxt'. 'Text' rather than @TableName b@ because one store spans
+    -- backends; a 'toTxt' collision between two distinct tables would conflate
+    -- them and evict both, which is over-eviction (safe), never under-eviction.
+    smsFingerprints :: !(HashMap Text Value),
+    smsCache :: !MemoCache
+  }
+
+newMemoStore :: (MonadIO m) => m MemoStore
+newMemoStore = liftIO $ newIORef mempty
+
+-- | Run a memoization pass seeded from the store: evict whatever the fingerprints
+-- say changed, build, then write the resulting cache back.
+--
+-- @currentFingerprints@ is this build's per-table content fingerprint for the
+-- @(source, schema)@ being built. A table is considered changed when its
+-- fingerprint differs from the stored one /or/ it has no stored fingerprint at
+-- all — which is what makes untrack-then-retrack safe: the removed table's
+-- fingerprint disappears, so re-tracking it looks "new" and its stale nodes are
+-- evicted before reuse. (Between untrack and retrack those nodes linger
+-- unreferenced; that is a bounded memory cost, not a correctness one.)
+withSchemaMemoCache ::
+  forall b m a.
+  (Backend b, MonadIO m) =>
+  MemoStore ->
+  SourceName ->
+  SchemaName ->
+  RoleName ->
+  HashMap (TableName b) Value ->
+  MemoizeT m a ->
+  m a
+withSchemaMemoCache store sourceName schemaName roleName currentFingerprints action = do
+  previous <- liftIO $ HashMap.lookup storeKey <$> readIORef store
+  let storedFingerprints = maybe mempty smsFingerprints previous
+      seeded = maybe emptyMemoCache smsCache previous
+      changed =
+        HS.fromList
+          [ tableName
+            | (tableName, fingerprint) <- HashMap.toList currentFingerprints,
+              HashMap.lookup (toTxt tableName) storedFingerprints /= Just fingerprint
+          ]
+      (evicted, _stats) = evictTables @b sourceName changed seeded
+  (result, cache') <- runMemoizeTWith evicted action
+  liftIO
+    $ modifyIORef' store
+    $ HashMap.insert storeKey (SchemaMemoState freshFingerprints cache')
+  pure result
+  where
+    storeKey = (sourceName, schemaName, roleName)
+    freshFingerprints =
+      HashMap.fromList
+        [(toTxt tableName, fingerprint) | (tableName, fingerprint) <- HashMap.toList currentFingerprints]

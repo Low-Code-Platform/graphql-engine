@@ -460,10 +460,34 @@ in `Cache.hs`; the SDL-equality gate is not built.
   `const True` ⇒ degrades to a cold build; cycle termination; id non-reuse; dangling-edge pruning.
 - ✅ **2b — backend-aware classifier** (§6.3). `Hasura/GraphQL/Schema/MemoInvalidate.hs` + 4 tests; all 39
   `memoizeOn` sites audited and classified. Suite: **1279 examples, 0 failures**.
-- ⬜ **2c — persistence + wiring** (§6.4): per-`(source, schema)` `IORef` store; derive the changed-table set
-  (per-table fingerprints, cf. §10.2); call `runMemoizeTWith` from `buildAllRoleParsersForSchema`
-  (`Schema.hs:801`) instead of `runMemoizeT`. **Nothing in the engine seeds a cache until this lands** — the
-  build is still cold every time, i.e. behaviour is unchanged.
+- ✅ **2c — persistence + wiring. DONE 2026-07-15, but OFF BY DEFAULT.** Gated behind a new experimental
+  feature `EFPersistentMemoCache` (key `persistent_memo_cache`), mirroring `EFEnableRelaySchema`. With the
+  flag off, `buildAllRoleParsersForSchema` receives `Nothing` and calls `runMemoizeT` exactly as before, so
+  **the default path is byte-for-byte the pre-Phase-8 build**. Suite: 1279 examples, 0 failures.
+  - `MemoStore = IORef (HashMap (SourceName, SchemaName, RoleName) SchemaMemoState)` in
+    `Schema/MemoInvalidate.hs`, holding the previous build's per-table fingerprints + `MemoCache`.
+  - Created once in `buildRebuildableSchemaCache` and passed to `buildSchemaCacheRule`; the rule closes over
+    it, so every `Inc.rebuildRule` rebuild sees the previous build's caches. A plain `IORef` suffices —
+    rebuilds are serialised by `withMVarMasked` (`AppStateRef.hs:126-136`).
+  - `withSchemaMemoCache` does the seed → evict → build → store-back cycle.
+  - **`memoStore` needed no arrow threading**: `buildSchemaParsersForSchema` is a `where`-binding of
+    `buildSchemaCacheRule`, so the rule's parameters are already in scope. Likewise the flag was already
+    present in `effectiveKey`'s `CacheDynamicConfig` (previously discarded as `_effectiveKey`). Only
+    `SchemaName` had to be added to the payload.
+  - **`Typeable (ScalarType b)` was added as a `Backend` superclass.** `BackendSchema b` did not imply it and
+    `AB.dispatchAnyBackendArrow @BackendSchema @BackendMetadata` supplies nothing else, so it could not be
+    threaded in at the call site. `Backend` already carries `Typeable (Column b)`, `Typeable (ColumnPath b)`
+    and `Typeable b`; every backend satisfies the new one automatically.
+  - **Untrack-then-retrack is safe by construction:** fingerprints are rewritten from the *current* tables
+    each build, so an untracked table's fingerprint disappears; re-tracking it therefore looks "new" and its
+    stale nodes are evicted before any reuse. Between untrack and retrack those nodes linger unreferenced —
+    a bounded memory cost, not a correctness one.
+  - **Role dimension retained deliberately** despite locked decision 1. It is inert at `roles = 1`, but
+    seeding one role's build from another's cache would reuse parsers built under different permissions — a
+    stale-schema bug invisible today and latent the day a role is added. Cost: one tuple field.
+  - **Known cost, not yet addressed:** `withSchemaMemoCache` computes `toJSON` per table, *in addition to*
+    the existing `schemaContentKey` whole-pair fingerprint (§10.2) — so the flag currently doubles that
+    O(total) work. Fixing §10.2 should replace both with one per-table fingerprint set.
 - ⬜ **2d — the SDL-equality gate** (§8). Land *before* 2c is enabled by default.
 - ⬜ **2e — relationship-heavy fixture** (§12 note) + bench.
 

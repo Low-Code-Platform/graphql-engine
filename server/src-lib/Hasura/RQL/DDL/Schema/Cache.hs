@@ -51,6 +51,7 @@ import Hasura.Function.Cache
 import Hasura.Function.Metadata (FunctionMetadata (..))
 import Hasura.GraphQL.Context (GQLContext, RoleContext)
 import Hasura.GraphQL.Schema (RoleContextValue, SchemaFieldParsers, assemblePerPairContexts, buildAllRoleParsersForSchema, buildGQLContext, buildSchemaOptions, partitionSourceBySchema)
+import Hasura.GraphQL.Schema.MemoInvalidate (MemoStore, newMemoStore)
 import Hasura.GraphQL.Schema.Backend (BackendSchema)
 import Hasura.GraphQL.Schema.Common
 import Hasura.GraphQL.Schema.Instances ()
@@ -175,9 +176,14 @@ buildRebuildableSchemaCache ::
   Maybe SchemaRegistryContext ->
   CacheBuild RebuildableSchemaCache
 buildRebuildableSchemaCache logger env disableNativeQueryValidation metadataWithVersion dynamicConfig mSchemaRegistryContext = do
+  -- One store per 'RebuildableSchemaCache': the rule closes over it, so every
+  -- rebuild driven by 'Inc.rebuildRule' sees the caches left by the previous one.
+  -- Rebuilds are serialised by the 'AppStateRef' lock, so a plain IORef is safe.
+  -- (A fresh 'RebuildableSchemaCache' starts cold — correct, just slower.)
+  memoStore <- newMemoStore
   result <-
     flip runReaderT CatalogSync
-      $ Inc.build (buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryContext) (metadataWithVersion, dynamicConfig, initialInvalidationKeys, Nothing)
+      $ Inc.build (buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryContext memoStore) (metadataWithVersion, dynamicConfig, initialInvalidationKeys, Nothing)
 
   pure $ RebuildableSchemaCache (fst $ Inc.result result) initialInvalidationKeys (Inc.rebuildRule result)
 
@@ -429,9 +435,13 @@ buildSchemaCacheRule ::
   Env.Environment ->
   DisableNativeQueryValidation ->
   Maybe SchemaRegistryContext ->
+  -- | Persisted per-(source, schema, role) memo caches (Phase 8). Created once per
+  -- 'RebuildableSchemaCache' and reused by every rebuild, so parsers can survive
+  -- across metadata changes. Only consulted when 'EFPersistentMemoCache' is on.
+  MemoStore ->
   (MetadataWithResourceVersion, CacheDynamicConfig, InvalidationKeys, Maybe StoredIntrospection)
     `arr` (SchemaCache, (SourcesIntrospectionStatus, SchemaRegistryAction))
-buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryContext = proc (MetadataWithResourceVersion metadataNoDefaults interimMetadataResourceVersion, dynamicConfig, invalidationKeys, storedIntrospection) -> do
+buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryContext memoStore = proc (MetadataWithResourceVersion metadataNoDefaults interimMetadataResourceVersion, dynamicConfig, invalidationKeys, storedIntrospection) -> do
   invalidationKeysDep <- Inc.newDependency -< invalidationKeys
   let metadataDefaults = _cdcMetadataDefaults dynamicConfig
       metadata@Metadata {..} = overrideMetadataDefaults metadataNoDefaults metadataDefaults
@@ -609,7 +619,7 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
                       perSchemaResults <-
                         (|
                           Inc.keyed
-                            ( \_schemaName (filteredSi, schemaKeyDep) -> do
+                            ( \schemaName (filteredSi, schemaKeyDep) -> do
                                 metadataKeyValue <- Inc.dependOn -< metadataKeyDep'
                                 schemaKeyValue <- Inc.dependOn -< schemaKeyDep
                                 let effectiveInvalidationKey = fromMaybe metadataKeyValue schemaKeyValue
@@ -649,7 +659,7 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
                                     -<
                                       KeyedBy
                                         effectiveKey
-                                        (sff', schemaOptions', sources', remoteSchemaCtxs', remoteSchemaPermsCtx', allRoles', filteredSi)
+                                        (schemaName, sff', schemaOptions', sources', remoteSchemaCtxs', remoteSchemaPermsCtx', allRoles', filteredSi)
                                 -- §5.3 "where the win is": assemble this pair's per-role 'GQLContext'
                                 -- right here, behind the SAME per-(source, schema) 'Inc.cache' key as its
                                 -- parsers, so a mutation to one pair re-assembles only that pair. Keyed on
@@ -1110,7 +1120,8 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
         -- (per-schema content fingerprint, effective invalidation key, role set,
         -- dynamic schema-build config)
         (Value, Inc.InvalidationKey, [RoleName], CacheDynamicConfig)
-        ( SchemaSampledFeatureFlags,
+        ( SchemaName,
+          SchemaSampledFeatureFlags,
           Options.SchemaOptions,
           SourceCache,
           HashMap RemoteSchemaName RemoteSchemaCtx,
@@ -1120,8 +1131,15 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
         )
         `arr` HashMap RoleName SchemaFieldParsers
     buildSchemaParsersForSchema = Inc.cache proc
-      (KeyedBy _effectiveKey (sampledFeatureFlags, schemaOptions, sources, remotes, remoteSchemaPermsCtx, roles, filteredSi)) ->
-        bindA -< buildAllRoleParsersForSchema sampledFeatureFlags schemaOptions sources remotes remoteSchemaPermsCtx roles filteredSi
+      (KeyedBy (_, _, _, dynConfig) (schemaName, sampledFeatureFlags, schemaOptions, sources, remotes, remoteSchemaPermsCtx, roles, filteredSi)) -> do
+        -- 'memoStore' is a parameter of 'buildSchemaCacheRule', so it is in scope
+        -- here and does not need threading through the arrow. Passing 'Nothing'
+        -- yields the pre-Phase-8 cold build.
+        let mMemoStore =
+              if EFPersistentMemoCache `HS.member` _cdcExperimentalFeatures dynConfig
+                then Just memoStore
+                else Nothing
+        bindA -< buildAllRoleParsersForSchema mMemoStore schemaName sampledFeatureFlags schemaOptions sources remotes remoteSchemaPermsCtx roles filteredSi
 
     -- §5.3: per-(source, DB schema) assembly of the per-role 'GQLContext',
     -- 'Inc.cache'd under the SAME 'effectiveKey' as the pair's parsers. This is

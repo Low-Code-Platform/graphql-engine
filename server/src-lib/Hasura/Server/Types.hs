@@ -118,6 +118,21 @@ data ExperimentalFeature
     -- actually use the @/v1beta1/relay@ endpoint must opt in with this feature.
     -- See @rfcs/per-schema-gql-context.md@ §12.11–§12.13.
     EFEnableRelaySchema
+  | -- | Reuse memoized GraphQL parsers across schema-cache builds instead of
+    -- rebuilding every table's parser tree on every metadata change.
+    --
+    -- A mutation scoped to one table currently rebuilds every table in that DB
+    -- schema; on a 600-table schema that is ~1.1s of the ~1.5s mutation, ~599
+    -- tables of which did not change. With this on, unchanged parsers are seeded
+    -- from the previous build and only the changed table's subtree (plus anything
+    -- transitively embedding it) is rebuilt.
+    --
+    -- __Off by default while the eviction classifier is being validated.__ A
+    -- classifier that fails to recognise a memo key shape would reuse a stale
+    -- parser and silently serve a stale schema, so this stays opt-in until the
+    -- byte-identical-SDL gate lands (@rfcs/phase8-persistent-memo-cache.md@ §8,
+    -- Stage 2d).
+    EFPersistentMemoCache
   deriving (Bounded, Enum, Eq, Generic, Show)
 
 experimentalFeatureKey :: ExperimentalFeature -> Text
@@ -136,6 +151,7 @@ experimentalFeatureKey = \case
   EFNoNullUnboundVariableDefault -> "no_null_unbound_variable_default"
   EFRemoveEmptySubscriptionResponses -> "remove_empty_subscription_responses"
   EFEnableRelaySchema -> "enable_relay_schema"
+  EFPersistentMemoCache -> "persistent_memo_cache"
 
 instance Hashable ExperimentalFeature
 
