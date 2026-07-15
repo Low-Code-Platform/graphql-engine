@@ -216,10 +216,50 @@ Note the third row is what makes this safe: a node like `mkNumericAggFields (Tex
 of a table node, so reverse-reachability never reaches it from a table change — but it does not need to,
 because its key changes when its column does.
 
-**Stage 2b (not started): the backend-aware classifier.** `evictWith`'s predicate is generic; the classifier
-that maps "these tables changed" onto key shapes needs the concrete backend `b` in scope to `cast` to
-`(SourceName, TableName b)`. That is available: `buildSchemaParsersForSchema` already runs inside
-`AB.dispatchAnyBackendArrow @BackendSchema @BackendMetadata` (`Cache.hs`), where `b` is known.
+**Stage 2b — the backend-aware classifier. ✅ DONE 2026-07-15.**
+`Hasura/GraphQL/Schema/MemoInvalidate.hs`:
+
+```haskell
+invalidatedByTables :: (Backend b, Typeable (ScalarType b)) => SourceName -> HashSet (TableName b) -> MemoizationKey t -> Bool
+evictTables         :: (Backend b, Typeable (ScalarType b)) => SourceName -> HashSet (TableName b) -> MemoCache -> (MemoCache, EvictionStats)
+```
+
+It lives outside `Control.Monad.Memoize` because it needs the concrete `b` to cast to `TableName b`. That is
+available at the wiring site: `buildSchemaParsersForSchema` runs inside
+`AB.dispatchAnyBackendArrow @BackendSchema @BackendMetadata` (`Cache.hs`).
+
+**Audit outcome (all 39 `memoizeOn` sites):**
+
+| shape | class | sites |
+|---|---|---|
+| `(SourceName, TableName b)` | evict-if-changed | `Select.hs:582,691,1060`; `Mutation.hs:198,302,339,503`; `OnConflict.hs:154`; `OrderBy.hs:246`; `SubscriptionStream.hs:197`; **`BoolExp.hs:103`**, **`OrderBy.hs:114`** |
+| `(SourceName, TableName b, G.Name)` | evict-if-changed | `Select.hs:126,184,236,299`; `SubscriptionStream.hs:269` |
+| `(ScalarType b, G.Nullability)` | reuse | `Postgres:426`, `MSSQL:176`, `DataConnector:493` |
+| `(ColumnType b, G.Nullability)` | reuse | `BigQuery:110` |
+| `ColumnType b` | reuse | `Postgres:585`, `MSSQL:309`, `BigQuery:247` |
+| `(Text, ColumnInfo b)` | reuse | `Select.hs:1176` |
+| everything else | **evict (conservative)** | logical models, native queries, actions, remote schemas, `nodeInterface ()`, `streamColumnValueParser` |
+
+Two findings worth recording:
+
+1. **`boolExpInternal` / `orderByExpInternal` are polymorphic in their key** (`forall name. (Ord name,
+   Typeable name, ...)`), so the shape is decided by callers. `tableBoolExp` and `tableOrderByExp` pass
+   `tableInfoName tableInfo` ⇒ `(SourceName, TableName b)` — caught. The *logical model* wrappers pass a
+   `G.Name` ⇒ a different shape ⇒ class 3 (conservatively evicted). Correct either way, and `app_test` has
+   no logical models.
+2. **Reusing the content-keyed class is not an optimisation, it is load-bearing.** `columnParser` and
+   `comparisonExps` are shared by *every* table. Evicting them would make reverse-reachability sweep every
+   parent — i.e. the whole schema — and the Phase 8 win would evaporate. The conservative default is only
+   safe *because* these are classified explicitly.
+
+**Typeable subtlety:** `Backend b` supplies `Typeable b`, `Typeable (TableName b)`, `Typeable (ColumnType
+b)` and `Typeable (ColumnInfo b)`, but **not** `Typeable (ScalarType b)` — `ScalarType` is a type family, so
+it does not follow from `Typeable b` and must be requested explicitly.
+
+**Tests** (`src-test/Hasura/GraphQL/Schema/MemoInvalidateSpec.hs`, 4 examples): one node per shape, asserted
+shape by shape rather than inferred from an end-to-end build. The reuse cases use `error` builders, so a
+wrongly-evicted content node *fails loudly* instead of merely showing up in a survivor count. Also pins that
+a same-named table in a different source is untouched. Suite: **1279 examples, 0 failures**.
 
 1. **Direct set `D`** — entries whose key arg mentions a changed table. The `MemoizationKey` GADT already
    carries `Ord a, Typeable a` (`Memoize.hs:206-207`), so `Data.Typeable.cast` can test the known arg
@@ -418,8 +458,8 @@ in `Cache.hs`; the SDL-equality gate is not built.
   0 failures**. Covers: transitive eviction (evicting a leaf takes its embedder with it); *selective reuse*
   (evicting the root re-runs **exactly one** builder, leaf reused); `const False` ⇒ nothing rebuilds;
   `const True` ⇒ degrades to a cold build; cycle termination; id non-reuse; dangling-edge pruning.
-- ⬜ **2b — backend-aware classifier** (§6.3): map changed tables onto key shapes, with the conservative
-  default. Needs `b` in scope; available under the existing `AB.dispatchAnyBackendArrow`.
+- ✅ **2b — backend-aware classifier** (§6.3). `Hasura/GraphQL/Schema/MemoInvalidate.hs` + 4 tests; all 39
+  `memoizeOn` sites audited and classified. Suite: **1279 examples, 0 failures**.
 - ⬜ **2c — persistence + wiring** (§6.4): per-`(source, schema)` `IORef` store; derive the changed-table set
   (per-table fingerprints, cf. §10.2); call `runMemoizeTWith` from `buildAllRoleParsersForSchema`
   (`Schema.hs:801`) instead of `runMemoizeT`. **Nothing in the engine seeds a cache until this lands** — the
