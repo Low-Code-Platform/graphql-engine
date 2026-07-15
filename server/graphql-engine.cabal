@@ -1004,6 +1004,7 @@ library
                      , Hasura.GraphQL.Schema.Instances
                      , Hasura.GraphQL.Schema.Introspect
                      , Hasura.GraphQL.Schema.MemoInvalidate
+                     , Hasura.GraphQL.Schema.TableDeps
                      , Hasura.GraphQL.Schema.Mutation
                      , Hasura.GraphQL.Schema.NamingCase
                      , Hasura.GraphQL.Schema.Node
@@ -1240,6 +1241,7 @@ test-suite graphql-engine-tests
     Hasura.GraphQL.Schema.MemoCacheGateSpec
     Hasura.GraphQL.Schema.MemoInvalidateSpec
     Hasura.GraphQL.Schema.RemoteSpec
+    Hasura.GraphQL.Schema.TableDepsSpec
     Hasura.Metadata.DTO.MetadataDTOSpec
     Hasura.QuickCheck.Instances
     Hasura.RQL.DDL.Schema.Cache.PartialRebuildSpec
