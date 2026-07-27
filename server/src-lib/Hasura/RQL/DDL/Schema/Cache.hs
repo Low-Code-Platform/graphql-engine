@@ -36,6 +36,7 @@ import Data.Has
 import Data.HashMap.Strict.Extended qualified as HashMap
 import Data.HashMap.Strict.InsOrd.Extended qualified as InsOrdHashMap
 import Data.HashSet qualified as HS
+import Data.IORef (readIORef)
 import Data.Proxy
 import Data.Sequence qualified as Seq
 import Data.Set qualified as S
@@ -83,7 +84,7 @@ import Hasura.RQL.DDL.Schema.Cache.Config
 import Hasura.RQL.DDL.Schema.Cache.Dependencies
 import Hasura.RQL.DDL.Schema.Cache.Fields
 import Hasura.Backends.Postgres.SQL.Types (SchemaName)
-import Hasura.RQL.DDL.Schema.Cache.PartialRebuild (partitionIntrospectionBySchema)
+import Hasura.RQL.DDL.Schema.Cache.PartialRebuild (freshIntrospectionOverride, partitionIntrospectionBySchema)
 import Hasura.RQL.DDL.Schema.Cache.Permission
 import Hasura.RQL.DDL.SchemaRegistry
 import Hasura.RQL.Types.Action
@@ -1694,13 +1695,26 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
                       case maybeResolvedSource of
                         Nothing -> returnA -< Nothing
                         Just (sourceConfig, source) -> do
+                          -- If the run_sql per-schema path injected a fresh introspection
+                          -- (already fetched post-DDL — no DB re-query, see
+                          -- 'freshIntrospectionOverride'), use its tables/functions but KEEP
+                          -- this source's scalars and logical models. Because
+                          -- 'partitionIntrospectionBySchema' stamps the source-wide scalars and
+                          -- logical models into EVERY schema slice, reusing them keeps each
+                          -- UNCHANGED schema's slice byte-equal, so its per-schema
+                          -- 'buildTableCacheForSchema' stays an Inc cache hit (no cascade).
+                          -- Only the altered schema's slice differs and is rebuilt.
+                          overrideMeta <- bindA -< liftIO (HashMap.lookup sourceName <$> readIORef freshIntrospectionOverride)
+                          let resolvedSource = case overrideMeta >>= AB.unpackAnyBackend @b of
+                                Just fresh -> fresh {_rsScalars = _rsScalars source, _rsLogicalModels = _rsLogicalModels source}
+                                Nothing -> source
                           let metadataInvalidationKey = Inc.selectD #_ikMetadata invalidationKeys
                               (tableInputs, _, _) = unzip3 $ map mkTableInputs $ InsOrdHashMap.elems $ _smTables sourceMetadata
                               scNamingConvention = _scNamingConvention $ _smCustomization sourceMetadata
                               !namingConv = if isNamingConventionEnabled then fromMaybe defaultNC scNamingConvention else HasuraCase
                               -- Partition introspection and table inputs by schema so that
                               -- buildTableCacheForSchema can be cached per schema.
-                              schemaMap = partitionIntrospectionBySchema @b source
+                              schemaMap = partitionIntrospectionBySchema @b resolvedSource
                               sourceSchemaKeysDep = Inc.selectD #_ikSourceSchemas invalidationKeys
                               tableInputsBySchema =
                                 HashMap.fromListWith (<>)
@@ -1750,7 +1764,7 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
                             -<
                               Just
                                 $ AB.mkAnyBackend @b
-                                $ PartiallyResolvedSource sourceMetadata sourceConfig source tablesCoreInfo eventTriggerInfoMaps
+                                $ PartiallyResolvedSource sourceMetadata sourceConfig resolvedSource tablesCoreInfo eventTriggerInfoMaps
                   )
                   -<
                     (exists, (dynamicConfig, invalidationKeys, storedIntrospection, defaultNC, isNamingConventionEnabled))

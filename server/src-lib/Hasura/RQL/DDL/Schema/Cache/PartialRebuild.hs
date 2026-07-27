@@ -19,11 +19,13 @@ module Hasura.RQL.DDL.Schema.Cache.PartialRebuild
 
     -- * Helpers
     tableSchemaName,
+    freshIntrospectionOverride,
   )
 where
 
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet qualified as HashSet
+import Data.IORef (IORef, newIORef)
 import Hasura.Backends.Postgres.SQL.Types (SchemaName (..))
 import Hasura.Prelude
 import Hasura.RQL.Types.Backend (TableName)
@@ -41,6 +43,31 @@ import Hasura.RQL.Types.SchemaCache.Build
 import Hasura.RQL.Types.Source (BackendSourceInfo, DBObjectsIntrospection (..), SourceInfo (..))
 import Hasura.SQL.AnyBackend qualified as AB
 import Hasura.Table.Cache (TableInfo, tableInfoName)
+import System.IO.Unsafe (unsafePerformIO)
+
+-- | An authoritative, freshly-fetched per-source introspection override for a
+-- per-schema rebuild.
+--
+-- A per-schema rebuild ('buildSchemaCacheForDbSchema') reuses the memoised source
+-- introspection and does not re-query the database, so on its own it would not
+-- observe schema-altering DDL (new/dropped columns, functions). The @run_sql@
+-- per-schema path (see @withMetadataCheck@) already fetches fresh introspection
+-- post-DDL to compute the metadata diff; it deposits that here so the rebuild
+-- reuses it rather than either serving stale data or paying for a third database
+-- introspection.
+--
+-- Stored as an 'AB.AnyBackend' of the backend-indexed 'DBObjectsIntrospection'
+-- (not JSON) so writing and reading avoid an encode/decode round-trip of the full
+-- source introspection on every ALTER.
+--
+-- Concurrency: a process-global is safe here only because schema-cache builds for
+-- a source are serialised (the metadata write lock). It is populated immediately
+-- before a single synchronous per-schema build and cleared immediately after
+-- (even on error), so no other build ever observes a stray value. If schema-cache
+-- builds ever become concurrent, thread this through the build inputs instead.
+{-# NOINLINE freshIntrospectionOverride #-}
+freshIntrospectionOverride :: IORef (HashMap.HashMap SourceName (AB.AnyBackend DBObjectsIntrospection))
+freshIntrospectionOverride = unsafePerformIO (newIORef mempty)
 
 -------------------------------------------------------------------------------
 -- Phase 4 — Merge Logic

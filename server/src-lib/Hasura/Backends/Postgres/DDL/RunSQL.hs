@@ -22,10 +22,12 @@ module Hasura.Backends.Postgres.DDL.RunSQL
   )
 where
 
+import Control.Exception.Lifted (finally)
 import Control.Monad.Trans.Control (MonadBaseControl)
 import Data.Aeson
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet qualified as HS
+import Data.IORef (modifyIORef')
 import Data.List.NonEmpty qualified as NE
 import Data.Text qualified as T
 import Data.Text.Extended
@@ -47,7 +49,7 @@ import Hasura.EncJSON
 import Hasura.Function.Cache
 import Hasura.Prelude
 import Hasura.RQL.DDL.Schema
-import Hasura.RQL.DDL.Schema.Cache.PartialRebuild (buildSchemaCacheForDbSchema)
+import Hasura.RQL.DDL.Schema.Cache.PartialRebuild (buildSchemaCacheForDbSchema, freshIntrospectionOverride)
 import Hasura.RQL.DDL.Schema.Diff qualified as Diff
 import Hasura.RQL.Types.Backend
 import Hasura.RQL.Types.BackendType
@@ -167,7 +169,17 @@ fetchTablesFunctionsMetadata ::
   TableCache ('Postgres pgKind) ->
   HS.HashSet (TableName ('Postgres pgKind)) ->
   HS.HashSet (FunctionName ('Postgres pgKind)) ->
-  m ([Diff.TableMeta ('Postgres pgKind)], [Diff.FunctionMeta ('Postgres pgKind)])
+  -- | In addition to the diff-shaped table/function metas, returns the RAW
+  -- introspection maps ('DBTablesMetadata' / 'DBFunctionsMetadata'). These are
+  -- exactly the '_rsTables' / '_rsFunctions' of a 'DBObjectsIntrospection' and
+  -- let the post-DDL caller reuse this introspection for the schema-cache
+  -- rebuild instead of re-querying the DB (see @withMetadataCheck@).
+  m
+    ( [Diff.TableMeta ('Postgres pgKind)],
+      [Diff.FunctionMeta ('Postgres pgKind)],
+      DBTablesMetadata ('Postgres pgKind),
+      DBFunctionsMetadata ('Postgres pgKind)
+    )
 fetchTablesFunctionsMetadata tableCache tables functions = do
   tableMetaInfos <- fetchTableMetadata tables
   functionMetaInfos <- fetchFunctionMetadata @pgKind functions
@@ -193,7 +205,7 @@ fetchTablesFunctionsMetadata tableCache tables functions = do
                   ]
         ]
 
-  pure (tableMetas, functionMetas)
+  pure (tableMetas, functionMetas, tableMetaInfos, functionMetaInfos)
   where
     mkFunctionMetas ::
       HashMap QualifiedFunction (FunctionOverloads ('Postgres pgKind)) ->
@@ -365,13 +377,21 @@ withMetadataCheck sqlGen source mSchema cascade txType runSQLQuery = do
   SourceInfo {..} <- askSourceInfo @('Postgres pgKind) source
 
   -- Run SQL query and metadata checker in a transaction
-  (queryResult, metadataUpdater) <- runTxWithMetadataCheck source _siConfiguration txType _siTables _siFunctions cascade runSQLQuery
+  (queryResult, metadataUpdater, freshIntrospection) <- runTxWithMetadataCheck source _siConfiguration txType _siTables _siFunctions cascade runSQLQuery
 
   -- Build schema cache with updated metadata
   withNewInconsistentObjsCheck
     $ case mSchema of
-        Just schema -> buildSchemaCacheForDbSchema source schema metadataUpdater
-        Nothing -> buildSchemaCacheWithInvalidations mempty {ciSources = HS.singleton source} metadataUpdater
+      Just schema -> do
+        -- Feed the post-DDL introspection we already fetched into the per-schema
+        -- rebuild so it observes the DDL (new/dropped columns, functions) WITHOUT
+        -- re-querying the DB. Without this, the per-schema rebuild reuses stale
+        -- memoised introspection (see 'freshIntrospectionOverride'). Cleared
+        -- immediately after (even on error) so no other build path is affected.
+        liftIO $ modifyIORef' freshIntrospectionOverride (HashMap.insert source (AB.mkAnyBackend @('Postgres pgKind) freshIntrospection))
+        buildSchemaCacheForDbSchema source schema metadataUpdater
+          `finally` liftIO (modifyIORef' freshIntrospectionOverride (HashMap.delete source))
+      Nothing -> buildSchemaCacheWithInvalidations mempty {ciSources = HS.singleton source} metadataUpdater
 
   postRunSQLSchemaCache <- askSchemaCache
 
@@ -415,7 +435,10 @@ runTxWithMetadataCheck ::
   FunctionCache ('Postgres pgKind) ->
   Bool ->
   PG.TxET QErr m a ->
-  m (a, MetadataModifier)
+  -- | Also returns a fresh 'DBObjectsIntrospection' assembled from the post-DDL
+  -- introspection that was fetched for the diff, so the caller can hand it to a
+  -- per-schema rebuild instead of forcing a re-query (see @withMetadataCheck@).
+  m (a, MetadataModifier, DBObjectsIntrospection ('Postgres pgKind))
 runTxWithMetadataCheck source sourceConfig txType tableCache functionCache cascadeDependencies tx =
   liftEitherM
     $ runExceptT
@@ -428,7 +451,7 @@ runTxWithMetadataCheck source sourceConfig txType tableCache functionCache casca
       let tableNames = HashMap.keysSet tableCache
           computedFieldFunctions = mconcat $ map getComputedFieldFunctions (HashMap.elems tableCache)
           functionNames = HashMap.keysSet functionCache <> computedFieldFunctions
-      (preTxTablesMeta, preTxFunctionsMeta) <- fetchTablesFunctionsMetadata tableCache tableNames functionNames
+      (preTxTablesMeta, preTxFunctionsMeta, _, _) <- fetchTablesFunctionsMetadata tableCache tableNames functionNames
 
       -- Since the @'tx' may alter table/function names we use the OIDs of underlying tables
       -- (sourced from 'pg_class' for tables and 'pg_proc' for functions), which remain unchanged in the
@@ -439,10 +462,20 @@ runTxWithMetadataCheck source sourceConfig txType tableCache functionCache casca
       -- Run the transaction
       txResult <- tx
 
-      (postTxTablesMeta, postTxFunctionMeta) <-
+      (postTxTablesMeta, postTxFunctionMeta, postTxRawTables, postTxRawFunctions) <-
         uncurry (fetchTablesFunctionsMetadata tableCache)
           -- Fetch names of tables and functions using OIDs which also contains renamed items
           =<< fetchTablesFunctionsFromOids tableOids functionOids
+
+      -- Assemble a fresh 'DBObjectsIntrospection' from the post-DDL introspection
+      -- above (reused, not re-queried). _rsTables / _rsFunctions come straight from
+      -- the raw fetch; scalars and logical models are left EMPTY on purpose — the
+      -- schema-cache rebuild reuses the existing source's scalars/logical models
+      -- (see the 'freshIntrospectionOverride' consumer in Cache.hs). Keeping those
+      -- source-wide fields untouched is what lets unchanged schemas' partition
+      -- slices stay byte-equal so their per-schema build is an Inc cache hit.
+      let freshIntrospection =
+            DBObjectsIntrospection postTxRawTables postTxRawFunctions (ScalarMap mempty) mempty
 
       -- Calculate the tables diff (dropped & altered tables)
       let tablesDiff = Diff.getTablesDiff preTxTablesMeta postTxTablesMeta
@@ -485,7 +518,7 @@ runTxWithMetadataCheck source sourceConfig txType tableCache functionCache casca
         -- Propagate table changes to metadata
         Diff.processTablesDiff source tableCache tablesDiff
 
-      pure (txResult, metadataUpdater)
+      pure (txResult, metadataUpdater, freshIntrospection)
   where
     dontAllowFunctionOverloading ::
       (MonadError QErr n) =>
