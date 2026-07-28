@@ -813,6 +813,7 @@ buildTableCache = Inc.cache proc (source, sourceConfig, dbTablesMeta, tableBuild
         -<
           TableCoreInfo
             { _tciName = name,
+              _tciOid = _ptmiOid metadataTable,
               _tciFieldInfoMap = columnMap,
               _tciPrimaryKey = primaryKey,
               _tciUniqueConstraints = _ptmiUniqueConstraints metadataTable,

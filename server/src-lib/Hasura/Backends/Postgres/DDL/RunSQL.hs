@@ -219,6 +219,69 @@ fetchTablesFunctionsMetadata tableCache tables functions = do
           rawInfo <- NE.toList $ getFunctionOverloads overloads
       ]
 
+-- | Build the PRE-DDL table/function metadata (the "old" side of the table diff)
+-- for 'withMetadataCheck', reconstructing the table side from the in-memory schema
+-- cache rather than re-introspecting the database.
+--
+-- The schema cache already holds, per table, everything the table diff reads from
+-- its "old" argument: the table OID ('_tciOid'), the raw columns ('_tciRawColumns'),
+-- and the foreign keys ('_tciForeignKeys'). Fields the diff only reads from the
+-- "new" side (primary key, description, ...) are not needed here. This avoids the
+-- (whole-source) 'fetchTableMetadata' catalog query. Functions are still fetched
+-- (cheap, and their OIDs are not cached) so computed-field/function diffs are exact.
+--
+-- Because the "old" snapshot comes from the cache (the last successful build)
+-- rather than a fresh read, any out-of-band database drift since that build is
+-- reconciled by the subsequent diff — consistent with the engine's assumption that
+-- the schema cache reflects the database between builds.
+reconstructPreTxTablesFunctionsMetadata ::
+  forall pgKind m.
+  ( FetchFunctionMetadata pgKind,
+    BackendMetadata ('Postgres pgKind),
+    MonadTx m
+  ) =>
+  TableCache ('Postgres pgKind) ->
+  HS.HashSet (FunctionName ('Postgres pgKind)) ->
+  m ([Diff.TableMeta ('Postgres pgKind)], [Diff.FunctionMeta ('Postgres pgKind)])
+reconstructPreTxTablesFunctionsMetadata tableCache functions = do
+  functionMetaInfos <- fetchFunctionMetadata @pgKind functions
+  let functionMetas =
+        [ functionMeta
+          | function <- HS.toList functions,
+            functionMeta <- mkFunctionMetas functionMetaInfos function
+        ]
+      tableMetas =
+        [ Diff.TableMeta table (reconstructDBTableMetadata coreInfo) computedFieldInfos
+          | (table, tableInfo) <- HashMap.toList tableCache,
+            let coreInfo = _tiCoreInfo tableInfo
+                computedFieldInfos =
+                  [ Diff.ComputedFieldMeta fieldName functionMeta
+                    | computedField <- getComputedFields tableInfo,
+                      let fieldName = _cfiName computedField
+                          function = _cffName $ _cfiFunction computedField,
+                      functionMeta <- mkFunctionMetas functionMetaInfos function
+                  ]
+        ]
+  pure (tableMetas, functionMetas)
+  where
+    mkFunctionMetas functionMetaInfos function =
+      [ Diff.FunctionMeta (rfiOid rawInfo) function (rfiFunctionType rawInfo)
+        | Just overloads <- pure (HashMap.lookup function functionMetaInfos),
+          rawInfo <- NE.toList $ getFunctionOverloads overloads
+      ]
+    reconstructDBTableMetadata coreInfo =
+      DBTableMetadata
+        { _ptmiOid = _tciOid coreInfo,
+          _ptmiColumns = _tciRawColumns coreInfo,
+          -- Not read from the "old" side of the table diff; safe to omit.
+          _ptmiPrimaryKey = Nothing,
+          _ptmiUniqueConstraints = _tciUniqueConstraints coreInfo,
+          _ptmiForeignKeys = HS.map ForeignKeyMetadata (_tciForeignKeys coreInfo),
+          _ptmiViewInfo = _tciViewInfo coreInfo,
+          _ptmiDescription = _tciDescription coreInfo,
+          _ptmiExtraTableMetadata = _tciExtraTableMetadata coreInfo
+        }
+
 -- | Used as an escape hatch to run raw SQL against a database.
 runRunSQL ::
   forall (pgKind :: PostgresKind) m.
@@ -447,11 +510,13 @@ runTxWithMetadataCheck source sourceConfig txType tableCache functionCache casca
       -- Following steps maybe executed in a transaction depending on @'txType'.
       -- Running in a transaction helps to rollback the @'tx' execution in case of any exceptions.
 
-      -- Before running the @'tx', fetch metadata of existing tables and functions from Postgres.
-      let tableNames = HashMap.keysSet tableCache
-          computedFieldFunctions = mconcat $ map getComputedFieldFunctions (HashMap.elems tableCache)
+      -- Before running the @'tx', build the pre-DDL snapshot of tracked tables and
+      -- functions. The table side is reconstructed from the in-memory schema cache
+      -- (no catalog re-query — see 'reconstructPreTxTablesFunctionsMetadata');
+      -- functions are still fetched from Postgres.
+      let computedFieldFunctions = mconcat $ map getComputedFieldFunctions (HashMap.elems tableCache)
           functionNames = HashMap.keysSet functionCache <> computedFieldFunctions
-      (preTxTablesMeta, preTxFunctionsMeta, _, _) <- fetchTablesFunctionsMetadata tableCache tableNames functionNames
+      (preTxTablesMeta, preTxFunctionsMeta) <- reconstructPreTxTablesFunctionsMetadata tableCache functionNames
 
       -- Since the @'tx' may alter table/function names we use the OIDs of underlying tables
       -- (sourced from 'pg_class' for tables and 'pg_proc' for functions), which remain unchanged in the
