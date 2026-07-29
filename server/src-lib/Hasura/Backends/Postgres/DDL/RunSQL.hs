@@ -53,7 +53,7 @@ import Hasura.RQL.DDL.Schema.Cache.PartialRebuild (buildSchemaCacheForDbSchema, 
 import Hasura.RQL.DDL.Schema.Diff qualified as Diff
 import Hasura.RQL.Types.Backend
 import Hasura.RQL.Types.BackendType
-import Hasura.RQL.Types.Column (StructuredColumnInfo (..))
+import Hasura.RQL.Types.Column (StructuredColumnInfo (..), ciColumn)
 import Hasura.RQL.Types.Common
 import Hasura.RQL.Types.ComputedField
 import Hasura.RQL.Types.EventTrigger
@@ -282,6 +282,67 @@ reconstructPreTxTablesFunctionsMetadata tableCache functions = do
           _ptmiExtraTableMetadata = _tciExtraTableMetadata coreInfo
         }
 
+-- | Faithfully reconstruct a table's DB introspection metadata from the in-memory
+-- cache, INCLUDING the primary key (unlike the diff-only reconstruction in
+-- 'reconstructPreTxTablesFunctionsMetadata', which drops it). Used to rebuild the
+-- untouched schemas' side of a source-wide introspection when the post-DDL fetch is
+-- scoped to a single schema (see 'runTxWithMetadataCheck'), so those schemas stay
+-- byte-equal to the last build and neither vanish from nor cascade-rebuild the cache.
+reconstructDBTableMetadataFull ::
+  forall pgKind.
+  (BackendMetadata ('Postgres pgKind)) =>
+  TableCoreInfo ('Postgres pgKind) ->
+  DBTableMetadata ('Postgres pgKind)
+reconstructDBTableMetadataFull coreInfo =
+  DBTableMetadata
+    { _ptmiOid = _tciOid coreInfo,
+      _ptmiColumns = _tciRawColumns coreInfo,
+      _ptmiPrimaryKey = (\(PrimaryKey c cols) -> PrimaryKey c (fmap ciColumn cols)) <$> _tciPrimaryKey coreInfo,
+      _ptmiUniqueConstraints = _tciUniqueConstraints coreInfo,
+      _ptmiForeignKeys = HS.map ForeignKeyMetadata (_tciForeignKeys coreInfo),
+      _ptmiViewInfo = _tciViewInfo coreInfo,
+      _ptmiDescription = _tciDescription coreInfo,
+      _ptmiExtraTableMetadata = _tciExtraTableMetadata coreInfo
+    }
+
+-- | Build the diff-shaped table/function metas from ALREADY obtained raw
+-- introspection maps (mirrors 'fetchTablesFunctionsMetadata' but runs no catalog
+-- query). Used to assemble the source-wide post-DDL table metas from the merge of
+-- fresh (target schema) + cache-reconstructed (other schemas) raw tables.
+buildTableFunctionMetasFromRaw ::
+  forall pgKind.
+  (BackendMetadata ('Postgres pgKind)) =>
+  TableCache ('Postgres pgKind) ->
+  DBTablesMetadata ('Postgres pgKind) ->
+  HS.HashSet (FunctionName ('Postgres pgKind)) ->
+  DBFunctionsMetadata ('Postgres pgKind) ->
+  ([Diff.TableMeta ('Postgres pgKind)], [Diff.FunctionMeta ('Postgres pgKind)])
+buildTableFunctionMetasFromRaw tableCache tableMetaInfos functions functionMetaInfos =
+  (tableMetas, functionMetas)
+  where
+    functionMetas =
+      [ functionMeta
+        | function <- HS.toList functions,
+          functionMeta <- mkFunctionMetas function
+      ]
+    tableMetas =
+      [ Diff.TableMeta table tableMetaInfo (computedFieldInfos table)
+        | (table, tableMetaInfo) <- HashMap.toList tableMetaInfos
+      ]
+    computedFieldInfos table =
+      [ Diff.ComputedFieldMeta fieldName functionMeta
+        | Just tableInfo <- pure (HashMap.lookup table tableCache),
+          computedField <- getComputedFields tableInfo,
+          let fieldName = _cfiName computedField
+              function = _cffName $ _cfiFunction computedField,
+          functionMeta <- mkFunctionMetas function
+      ]
+    mkFunctionMetas function =
+      [ Diff.FunctionMeta (rfiOid rawInfo) function (rfiFunctionType rawInfo)
+        | Just overloads <- pure (HashMap.lookup function functionMetaInfos),
+          rawInfo <- NE.toList $ getFunctionOverloads overloads
+      ]
+
 -- | Used as an escape hatch to run raw SQL against a database.
 runRunSQL ::
   forall (pgKind :: PostgresKind) m.
@@ -439,8 +500,17 @@ withMetadataCheck ::
 withMetadataCheck sqlGen source mSchema cascade txType runSQLQuery = do
   SourceInfo {..} <- askSourceInfo @('Postgres pgKind) source
 
+  -- When a @schema@ arg is present, scope the post-DDL catalog introspection to that
+  -- schema only: fresh-fetch the target schema's tables and reconstruct every OTHER
+  -- schema's table metadata from the in-memory cache. The assembled introspection is
+  -- still SOURCE-WIDE (so the per-schema rebuild override and the diff see all
+  -- schemas), but the expensive per-table catalog query runs only over the target
+  -- schema. This matches the contract the per-schema rebuild already assumes below:
+  -- the DDL is confined to @schema@.
+  let mScopeSchema = mSchema
+
   -- Run SQL query and metadata checker in a transaction
-  (queryResult, metadataUpdater, freshIntrospection) <- runTxWithMetadataCheck source _siConfiguration txType _siTables _siFunctions cascade runSQLQuery
+  (queryResult, metadataUpdater, freshIntrospection) <- runTxWithMetadataCheck source _siConfiguration txType _siTables _siFunctions cascade mScopeSchema runSQLQuery
 
   -- Build schema cache with updated metadata
   withNewInconsistentObjsCheck
@@ -497,12 +567,17 @@ runTxWithMetadataCheck ::
   TableCache ('Postgres pgKind) ->
   FunctionCache ('Postgres pgKind) ->
   Bool ->
+  -- | When @Just schema@, only that schema's tables are fresh-introspected from the
+  -- catalog; all other schemas' table metadata is reconstructed from @tableCache@.
+  -- The returned introspection remains source-wide. When @Nothing@, every tracked
+  -- table is fresh-introspected.
+  Maybe SchemaName ->
   PG.TxET QErr m a ->
   -- | Also returns a fresh 'DBObjectsIntrospection' assembled from the post-DDL
   -- introspection that was fetched for the diff, so the caller can hand it to a
   -- per-schema rebuild instead of forcing a re-query (see @withMetadataCheck@).
   m (a, MetadataModifier, DBObjectsIntrospection ('Postgres pgKind))
-runTxWithMetadataCheck source sourceConfig txType tableCache functionCache cascadeDependencies tx =
+runTxWithMetadataCheck source sourceConfig txType tableCache functionCache cascadeDependencies mScopeSchema tx =
   liftEitherM
     $ runExceptT
     $ _pecRunTx (_pscExecCtx sourceConfig) (PGExecCtxInfo txType RunSQLQuery)
@@ -524,13 +599,47 @@ runTxWithMetadataCheck source sourceConfig txType tableCache functionCache casca
       let tableOids = HS.fromList $ map (_ptmiOid . Diff.tmInfo) preTxTablesMeta
           functionOids = HS.fromList $ map Diff.fmOid preTxFunctionsMeta
 
+      -- When scoping to a target schema, only that schema's table OIDs are
+      -- fresh-fetched from the catalog; the remaining tracked tables are cheap
+      -- reconstructions from the in-memory cache. Otherwise every tracked table OID
+      -- is fetched.
+      let tableOidsToFetch = case mScopeSchema of
+            Just schema ->
+              HS.fromList
+                [ _ptmiOid (Diff.tmInfo tm)
+                  | tm <- preTxTablesMeta,
+                    tableNameSchema @('Postgres pgKind) (Diff.tmTable tm) == schema
+                ]
+            Nothing -> tableOids
+
       -- Run the transaction
       txResult <- tx
 
-      (postTxTablesMeta, postTxFunctionMeta, postTxRawTables, postTxRawFunctions) <-
-        uncurry (fetchTablesFunctionsMetadata tableCache)
-          -- Fetch names of tables and functions using OIDs which also contains renamed items
-          =<< fetchTablesFunctionsFromOids tableOids functionOids
+      (postTxTablesMeta, postTxFunctionMeta, postTxRawTables, postTxRawFunctions) <- do
+        -- Fetch names of tables and functions using OIDs which also contains renamed items
+        (fetchTableNames, fetchFunctionNames) <- fetchTablesFunctionsFromOids tableOidsToFetch functionOids
+        (freshTableMetas, freshFunctionMetas, freshRawTables, rawFunctions) <-
+          fetchTablesFunctionsMetadata tableCache fetchTableNames fetchFunctionNames
+        case mScopeSchema of
+          Nothing -> pure (freshTableMetas, freshFunctionMetas, freshRawTables, rawFunctions)
+          Just schema -> do
+            -- Reconstruct the untouched schemas' raw table metadata from the cache
+            -- (faithful, incl. primary keys), so the assembled introspection stays
+            -- source-wide even though only @schema@ was fresh-fetched.
+            let nonTargetRawTables =
+                  HashMap.fromList
+                    [ (tn, reconstructDBTableMetadataFull coreInfo)
+                      | (tn, ti) <- HashMap.toList tableCache,
+                        tableNameSchema @('Postgres pgKind) tn /= schema,
+                        let coreInfo = _tiCoreInfo ti
+                    ]
+                mergedRawTables = freshRawTables <> nonTargetRawTables
+                -- The post-DDL table metas over the whole source: fresh for the
+                -- target schema, cache-reconstructed (== pre) for the rest, so the
+                -- diff is a no-op outside @schema@.
+                (mergedTableMetas, _) =
+                  buildTableFunctionMetasFromRaw tableCache mergedRawTables fetchFunctionNames rawFunctions
+            pure (mergedTableMetas, freshFunctionMetas, mergedRawTables, rawFunctions)
 
       -- Assemble a fresh 'DBObjectsIntrospection' from the post-DDL introspection
       -- above (reused, not re-queried). _rsTables / _rsFunctions come straight from
