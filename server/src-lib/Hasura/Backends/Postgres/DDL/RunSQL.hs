@@ -25,6 +25,7 @@ where
 import Control.Exception.Lifted (finally)
 import Control.Monad.Trans.Control (MonadBaseControl)
 import Data.Aeson
+import Data.Char (isAlphaNum)
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet qualified as HS
 import Data.IORef (modifyIORef')
@@ -135,6 +136,108 @@ isReadOnly runsql =
   case rTxAccessMode runsql of
     PG.ReadOnly -> True
     PG.ReadWrite -> False
+
+-- | Best-effort inference of the single DB schema a @run_sql@ statement is confined
+-- to, from the SQL text alone. Lets the scoped post-DDL introspection and per-schema
+-- rebuild engage when the caller did not pass an explicit @schema@ arg.
+--
+-- Deliberately conservative: returns @Just s@ only for a SINGLE, schema-qualified
+-- table DDL statement (@ALTER@/@CREATE@/@DROP TABLE <schema>.<table>@) all of whose
+-- qualified object references name the same schema @s@. Anything else — multiple
+-- statements, an unqualified target, a second schema referenced, non-table DDL,
+-- @CASCADE@, @SET SCHEMA@, @search_path@ — yields @Nothing@, which selects the
+-- always-correct full-source rebuild. A wrong guess would silently miss schema
+-- changes, so every uncertain case must fall back rather than scope.
+deriveTargetSchema :: Text -> Maybe SchemaName
+deriveTargetSchema raw =
+  let sql = T.strip (stripSqlComments raw)
+      body = fromMaybe sql (T.stripSuffix ";" sql)
+      low = T.toLower body
+   in if T.any (== ';') body
+        || any (`T.isInfixOf` low) ["cascade", "search_path", "set schema"]
+        then Nothing
+        else do
+          targetSchema <- parseTableTargetSchema body
+          let refSchemas = HS.fromList (map normalizeIdent (qualifiedSchemaTokens body))
+          if refSchemas == HS.singleton targetSchema
+            then Just (SchemaName targetSchema)
+            else Nothing
+
+-- | Parse a leading @(ALTER|CREATE|DROP) [modifiers] TABLE [modifiers]
+-- <schema>.<table>@ and return the normalized schema, or 'Nothing' if the statement
+-- is not table DDL or its target is not schema-qualified.
+parseTableTargetSchema :: Text -> Maybe Text
+parseTableTargetSchema t0 = do
+  afterVerb <- stripWordOneOf ["alter", "create", "drop"] t0
+  afterTable <- stripWordOneOf ["table"] (stripModifiers afterVerb)
+  (schemaTok, afterSchema) <- readIdentifier (T.stripStart (stripModifiers afterTable))
+  afterDot <- T.stripPrefix "." (T.stripStart afterSchema)
+  _ <- readIdentifier (T.stripStart afterDot) -- require a table name after the '.'
+  pure (normalizeIdent schemaTok)
+  where
+    stripModifiers s =
+      case readWord (T.stripStart s) of
+        Just (w, rest) | T.toLower w `elem` modifierWords -> stripModifiers rest
+        _ -> T.stripStart s
+    modifierWords =
+      ["if", "not", "exists", "only", "temp", "temporary", "unlogged", "global", "local"]
+
+-- | Strip one leading word if it (case-insensitively) equals one of @keywords@.
+stripWordOneOf :: [Text] -> Text -> Maybe Text
+stripWordOneOf keywords s = do
+  (w, rest) <- readWord (T.stripStart s)
+  if T.toLower w `elem` keywords then Just rest else Nothing
+
+-- | Read a bare (unquoted) word: a run of @[A-Za-z0-9_$]@. 'Nothing' at a non-word
+-- character (e.g. a quote or paren).
+readWord :: Text -> Maybe (Text, Text)
+readWord s =
+  let (w, rest) = T.span isIdentChar s
+   in if T.null w then Nothing else Just (w, rest)
+
+-- | Read an identifier: a double-quoted string (kept with its quotes) or a bare word.
+readIdentifier :: Text -> Maybe (Text, Text)
+readIdentifier s = case T.uncons s of
+  Just ('"', r) ->
+    let (inner, rest) = T.break (== '"') r
+     in case T.uncons rest of
+          Just ('"', rest') -> Just ("\"" <> inner <> "\"", rest')
+          _ -> Nothing
+  _ -> readWord s
+
+isIdentChar :: Char -> Bool
+isIdentChar c = isAlphaNum c || c == '_' || c == '$'
+
+-- | Strip surrounding double quotes (preserving case) or lowercase a bare word, to
+-- match how Postgres folds identifiers and how the schema cache stores schema names.
+normalizeIdent :: Text -> Text
+normalizeIdent t =
+  case T.stripPrefix "\"" t >>= T.stripSuffix "\"" of
+    Just inner -> inner
+    Nothing -> T.toLower t
+
+-- | All schema tokens appearing as the first part of a @schema.object@ reference.
+qualifiedSchemaTokens :: Text -> [Text]
+qualifiedSchemaTokens sql =
+  mapMaybe (fmap fst . readIdentifier . T.stripStart . T.pack)
+    $ TDFA.getAllTextMatches (T.unpack sql TDFA.=~ qualRefRegex :: TDFA.AllTextMatches [] String)
+  where
+    qualRefRegex :: String
+    qualRefRegex =
+      "(\"[^\"]+\"|[a-zA-Z_][a-zA-Z0-9_$]*)[ \t\r\n]*\\.[ \t\r\n]*(\"[^\"]+\"|[a-zA-Z_][a-zA-Z0-9_$]*)"
+
+-- | Remove @-- line@ and @/* block */@ SQL comments (best-effort; a comment marker
+-- inside a string literal is treated as a comment, which at worst makes the parse
+-- give up and fall back to the full rebuild).
+stripSqlComments :: Text -> Text
+stripSqlComments = stripBlock . stripLine
+  where
+    stripLine = T.intercalate "\n" . map (fst . T.breakOn "--") . T.splitOn "\n"
+    stripBlock s =
+      case T.breakOn "/*" s of
+        (before, rest)
+          | T.null rest -> before
+          | otherwise -> before <> stripBlock (T.drop 2 (snd (T.breakOn "*/" (T.drop 2 rest))))
 
 {- Note [Checking metadata consistency in run_sql]
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -368,8 +471,14 @@ runRunSQL sqlGen q@RunSQL {..} = do
   let pgExecCtx = _pscExecCtx sourceConfig
   if (isSchemaCacheBuildRequiredRunSQL q)
     then do
+      -- An explicit @schema@ arg wins; otherwise try to infer the target schema from
+      -- the SQL so the scoped introspection / per-schema rebuild can engage without
+      -- the caller having to name it. Inference is conservative (see
+      -- 'deriveTargetSchema'): when it cannot be certain, it yields Nothing and the
+      -- full-source rebuild runs.
+      let effectiveSchema = maybe (deriveTargetSchema rSql) Just rSchema
       -- see Note [Checking metadata consistency in run_sql]
-      withMetadataCheck @pgKind sqlGen rSource rSchema rCascade pgExecTxType
+      withMetadataCheck @pgKind sqlGen rSource effectiveSchema rCascade pgExecTxType
         $ withTraceContext traceCtx
         $ withUserInfo userInfo
         $ execSQL rSql
