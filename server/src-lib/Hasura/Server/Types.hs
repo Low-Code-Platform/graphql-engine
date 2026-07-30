@@ -110,6 +110,29 @@ data ExperimentalFeature
   | EFDisablePostgresArrays
   | EFNoNullUnboundVariableDefault
   | EFRemoveEmptySubscriptionResponses
+  | -- | Build the (global, O(total)) Relay GraphQL schema served at
+    -- @/v1beta1/relay@. Relay's @Node@ interface spans every source/schema and
+    -- cannot be cached per-(source, schema) like the Hasura schema, so it is
+    -- rebuilt in full on every metadata change — dominating mutation latency on
+    -- large metadata. It is therefore **disabled by default**; deployments that
+    -- actually use the @/v1beta1/relay@ endpoint must opt in with this feature.
+    -- See @rfcs/per-schema-gql-context.md@ §12.11–§12.13.
+    EFEnableRelaySchema
+  | -- | Turn OFF the per-table GraphQL schema cache.
+    --
+    -- The cache is ON by default. It reuses an unchanged table's field parsers
+    -- across schema-cache builds, so a mutation scoped to one table no longer
+    -- rebuilds every table in that DB schema. Measured on a 600-table schema:
+    -- track/untrack drop from ~1.4s to ~0.46s.
+    --
+    -- This is an escape hatch. The cache reuses a table's parsers unless the
+    -- table changed or it embeds one that did (see
+    -- "Hasura.GraphQL.Schema.TableDeps"); if that dependency analysis were ever
+    -- to under-reach, the served schema would be stale with no other symptom.
+    -- Setting this restores the unconditional rebuild.
+    --
+    -- See @rfcs/phase9-per-table-field-cache.md@.
+    EFDisablePerTableSchemaCache
   deriving (Bounded, Enum, Eq, Generic, Show)
 
 experimentalFeatureKey :: ExperimentalFeature -> Text
@@ -127,6 +150,8 @@ experimentalFeatureKey = \case
   EFDisablePostgresArrays -> "disable_postgres_arrays"
   EFNoNullUnboundVariableDefault -> "no_null_unbound_variable_default"
   EFRemoveEmptySubscriptionResponses -> "remove_empty_subscription_responses"
+  EFEnableRelaySchema -> "enable_relay_schema"
+  EFDisablePerTableSchemaCache -> "disable_per_table_schema_cache"
 
 instance Hashable ExperimentalFeature
 

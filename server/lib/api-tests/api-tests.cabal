@@ -267,6 +267,7 @@ library
     Test.Schema.TableRelationships.CrossSchemaObjectRelationshipsSpec
     Test.Schema.TableRelationships.ObjectRelationshipsSpec
     Test.Schema.TableRelationships.PortedSpec
+    Test.Schema.PartialSchemaCacheRebuildSpec
     Test.Schema.ViewsSpec
     Test.Subscriptions.DerivedDataSpec
     Test.Subscriptions.RowUpdatesSpec

@@ -18,6 +18,7 @@ module Hasura.Backends.Postgres.DDL.Source
     prepareCatalog,
     postDropSourceHook,
     resolveDatabaseMetadata,
+    resolveDatabaseMetadataForSchemas,
     resolveSourceConfig,
     logPGSourceCatalogMigrationLockedQueries,
     -- naughty exports, forgive me padre
@@ -191,6 +192,50 @@ resolveDatabaseMetadata sourceMetadata sourceConfig = do
     pure $ DBObjectsIntrospection tablesMeta functionsMeta (ScalarMap scalarsMap) mempty
   where
     -- A helper function to list all functions underpinning computed fields from a table metadata
+    getComputedFieldFunctionsMetadata :: TableMetadata ('Postgres pgKind) -> [FunctionName ('Postgres pgKind)]
+    getComputedFieldFunctionsMetadata =
+      map (_cfdFunction . _cfmDefinition) . InsOrdHashMap.elems . _tmComputedFields
+
+-- | Like 'resolveDatabaseMetadata' but restricts catalog introspection to the
+-- given schemas. Tables and functions outside those schemas are excluded from
+-- the returned 'DBObjectsIntrospection'; the caller is responsible for merging
+-- this partial result with the cached introspection of untouched schemas.
+resolveDatabaseMetadataForSchemas ::
+  forall pgKind m.
+  ( Backend ('Postgres pgKind),
+    ToMetadataFetchQuery pgKind,
+    FetchFunctionMetadata pgKind,
+    FetchTableMetadata pgKind,
+    MonadIO m,
+    MonadBaseControl IO m,
+    FF.HasFeatureFlagChecker m
+  ) =>
+  SourceMetadata ('Postgres pgKind) ->
+  SourceConfig ('Postgres pgKind) ->
+  NE.NonEmpty SchemaName ->
+  m (Either QErr (DBObjectsIntrospection ('Postgres pgKind)))
+resolveDatabaseMetadataForSchemas sourceMetadata sourceConfig schemas = do
+  enableNamingConventionSep2023 <- FF.checkFlag FF.namingConventionSep2023
+  runExceptT $ _pecRunTx (_pscExecCtx sourceConfig) (PGExecCtxInfo (Tx PG.ReadOnly Nothing) InternalRawQuery) do
+    let schemaSet = Set.fromList $ NE.toList schemas
+        filteredTables = InsOrdHashMap.filterWithKey (\tableName _ -> qSchema tableName `Set.member` schemaSet) $ _smTables sourceMetadata
+    tablesMeta <- fetchTableMetadata $ HashMap.keysSet $ InsOrdHashMap.toHashMap filteredTables
+    let allFunctions =
+          Set.fromList
+            $ filter ((`Set.member` schemaSet) . qSchema) (InsOrdHashMap.keys (_smFunctions sourceMetadata)) -- Tracked functions in target schemas
+            <> concatMap getComputedFieldFunctionsMetadata (InsOrdHashMap.elems filteredTables) -- Computed field functions for filtered tables
+    functionsMeta <- fetchFunctionMetadata @pgKind allFunctions
+    pgScalars <- fetchPgScalars
+    let customization = _smCustomization sourceMetadata
+        tCase
+          | enableNamingConventionSep2023 = fromMaybe HasuraCase $ _scNamingConvention customization
+          | otherwise = HasuraCase
+        scalarsMap = HashMap.fromList do
+          scalar <- Set.toList pgScalars
+          name <- afold @(Either QErr) $ mkScalarTypeName tCase scalar
+          pure (name, scalar)
+    pure $ DBObjectsIntrospection tablesMeta functionsMeta (ScalarMap scalarsMap) mempty
+  where
     getComputedFieldFunctionsMetadata :: TableMetadata ('Postgres pgKind) -> [FunctionName ('Postgres pgKind)]
     getComputedFieldFunctionsMetadata =
       map (_cfdFunction . _cfmDefinition) . InsOrdHashMap.elems . _tmComputedFields

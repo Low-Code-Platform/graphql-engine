@@ -4,13 +4,21 @@
 
 module Hasura.GraphQL.Schema
   ( buildGQLContext,
+    buildSchemaOptions,
+    buildSchemaRoleParsers,
+    buildAllRoleParsersForSchema,
+    assemblePerPairContexts,
+    partitionSourceBySchema,
+    SchemaFieldParsers (..),
+    RoleContextValue,
   )
 where
 
-import Control.Concurrent.Extended (concurrentlyEIO, forConcurrentlyEIO)
 import Control.Concurrent.STM qualified as STM
+import Control.Exception qualified as E
 import Control.Lens hiding (contexts)
 import Control.Monad.Memoize
+import Data.Aeson qualified as J
 import Data.Aeson.Ordered qualified as JO
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashMap.Strict.InsOrd qualified as InsOrdHashMap
@@ -18,6 +26,7 @@ import Data.HashSet qualified as Set
 import Data.List.Extended (duplicates)
 import Data.Text.Extended
 import Data.Text.NonEmpty qualified as NT
+import Data.Typeable (Typeable)
 import Database.PG.Query.Pool qualified as PG
 import Hasura.Authentication.Role (RoleName, adminRoleName, mkRoleNameSafe)
 import Hasura.Base.Error
@@ -32,6 +41,8 @@ import Hasura.GraphQL.Schema.Backend
 import Hasura.GraphQL.Schema.Common
 import Hasura.GraphQL.Schema.Instances ()
 import Hasura.GraphQL.Schema.Introspect
+import Hasura.GraphQL.Schema.TableDeps (tableDependencyGraph)
+import Hasura.GraphQL.Schema.TableFieldCache (TableFieldStore, TableFieldsCacher (..), mkTableFieldsCacher, noTableFieldsCache, prepareForBuild)
 import Hasura.GraphQL.Schema.Parser
   ( FieldParser,
     Kind (..),
@@ -69,12 +80,47 @@ import Hasura.RQL.Types.Source
 import Hasura.RQL.Types.SourceCustomization as SC
 import Hasura.RemoteSchema.Metadata
 import Hasura.RemoteSchema.SchemaCache
+import Hasura.Backends.Postgres.SQL.Types (SchemaName, getSchemaTxt)
+import Hasura.RQL.Types.Metadata.Backend (BackendMetadata, functionNameSchema, tableNameSchema)
 import Hasura.SQL.AnyBackend qualified as AB
 import Hasura.Server.Init.Logging
 import Hasura.Server.Types
 import Hasura.StoredProcedure.Cache (StoredProcedureCache, _spiReturns)
 import Hasura.Table.Cache
 import Language.GraphQL.Draft.Syntax qualified as G
+import System.IO.Unsafe (unsafeInterleaveIO)
+
+-------------------------------------------------------------------------------
+
+-- | Per-role field parsers produced for a single DB schema partition of a single source.
+-- Designed as a 'Monoid' so that per-schema results can be @mconcat@'d into a per-source
+-- result, and per-source results can be @mconcat@'d into the global merged parsers.
+data SchemaFieldParsers = SchemaFieldParsers
+  { _sfpQuery :: [FieldParser P.Parse (NamespacedField (QueryRootField UnpreparedValue))],
+    _sfpMutFrontend :: [FieldParser P.Parse (NamespacedField (MutationRootField UnpreparedValue))],
+    _sfpMutBackend :: [FieldParser P.Parse (NamespacedField (MutationRootField UnpreparedValue))],
+    _sfpSubscription :: [FieldParser P.Parse (NamespacedField (QueryRootField UnpreparedValue))],
+    _sfpApolloFed :: [(G.Name, Parser 'Output P.Parse (ApolloFederationParserFunction P.Parse))]
+    -- NOTE: Relay fields are intentionally NOT cached per (source, schema).
+    -- The Relay @Node@ interface (and @PageInfo@ etc.) is a single global type
+    -- spanning every source/schema; building the per-schema connection types in
+    -- separate memoize tables mints divergent @Node@ definitions (each carrying
+    -- only its partition's tables) and triggers "conflicting definitions for
+    -- GraphQL type 'Node'".  The full Relay schema is therefore built once per
+    -- role, in a single memoize pass, in 'assembleRelayRoleContext'.
+  }
+
+instance Semigroup SchemaFieldParsers where
+  a <> b =
+    SchemaFieldParsers
+      (_sfpQuery a <> _sfpQuery b)
+      (_sfpMutFrontend a <> _sfpMutFrontend b)
+      (_sfpMutBackend a <> _sfpMutBackend b)
+      (_sfpSubscription a <> _sfpSubscription b)
+      (_sfpApolloFed a <> _sfpApolloFed b)
+
+instance Monoid SchemaFieldParsers where
+  mempty = SchemaFieldParsers [] [] [] [] []
 
 -------------------------------------------------------------------------------
 
@@ -103,6 +149,19 @@ type RoleContextValue = (RoleContext GQLContext, HashSet InconsistentMetadata, G
 -- fields conflict, and only keep schemas that don't generate any. This results
 -- in a partial schema being available to the users, and a better error message
 -- than would arise from 'safeSelectionSet'.
+
+-- | Carries a 'QErr' from a Relay role-context build that was deferred via
+-- 'unsafeInterleaveIO' (see 'buildGQLContext'), so the error can be raised when
+-- the lazily-built context is first forced (e.g. on the first @/v1beta1/relay@
+-- request). In practice this should never fire: if the Relay schema were going
+-- to fail to build, the Hasura schema build would already have failed eagerly.
+newtype RelayBuildException = RelayBuildException QErr
+
+instance Show RelayBuildException where
+  show (RelayBuildException qerr) = "RelayBuildException " <> show (showQErr qerr)
+
+instance E.Exception RelayBuildException
+
 buildGQLContext ::
   forall m.
   ( MonadError QErr m,
@@ -115,19 +174,32 @@ buildGQLContext ::
   SQLGenCtx ->
   ApolloFederationStatus ->
   SourceCache ->
+  -- | Per-role, per-(source, schema) field parsers. Unlike the old global build,
+  -- these are NOT merged across pairs: each (source, schema) is assembled into
+  -- its own 'GQLContext' (see @per-schema-gql-context.md@, Phase 1). Retained
+  -- here only to build the root-field routing index.
+  HashMap RoleName (HashMap (SourceName, SchemaName) SchemaFieldParsers) ->
+  -- | Per-role, per-(source, schema) GraphQL contexts, already assembled and
+  -- cached independently per pair in 'buildSchemaCacheRule' (§5.3, "where the
+  -- win is"): a mutation to one pair re-assembles only that pair, and this
+  -- function just stitches the cached results together. The 'RoleContextValue'
+  -- carries the role context, its assembly inconsistencies, and its
+  -- introspection universe.
+  HashMap RoleName (HashMap (SourceName, SchemaName) RoleContextValue) ->
   HashMap RemoteSchemaName (RemoteSchemaCtx, MetadataObject) ->
   ActionCache ->
   AnnotatedCustomTypes ->
   Maybe SchemaRegistryContext ->
   Logger Hasura ->
   m
-    ( -- Hasura schema
+    ( -- Hasura schema, split per (source, schema)
       ( G.SchemaIntrospection,
-        HashMap RoleName (RoleContext GQLContext),
-        GQLContext,
+        HashMap RoleName (HashMap (SourceName, SchemaName) (RoleContext GQLContext)),
+        HashMap (SourceName, SchemaName) GQLContext,
+        HashMap G.Name (SourceName, SchemaName),
         HashSet InconsistentMetadata
       ),
-      -- Relay schema
+      -- Relay schema (dormant; still built globally, admin-only deployments don't use it)
       ( HashMap RoleName (RoleContext GQLContext),
         GQLContext
       ),
@@ -139,8 +211,12 @@ buildGQLContext
   remoteSchemaPermissions
   experimentalFeatures
   sqlGen
-  apolloFederationStatus
+  -- 'apolloFederationStatus' is consumed by the per-pair assembly node (which
+  -- now runs in 'buildSchemaCacheRule'), not here.
+  _apolloFederationStatus
   sources
+  perPairParsers
+  perRolePairContexts
   allRemoteSchemas
   allActions
   customTypes
@@ -152,50 +228,93 @@ buildGQLContext
             $ Set.fromList (allActionInfos ^.. folded . aiPermissions . to HashMap.keys . folded)
             <> Set.fromList (bool mempty remoteSchemasRoles $ remoteSchemaPermissions == Options.EnableRemoteSchemaPermissions)
         allActionInfos = HashMap.elems allActions
-        allTableRoles = Set.fromList $ getTableRoles =<< HashMap.elems sources
-        allLogicalModelRoles = Set.fromList $ getLogicalModelRoles =<< HashMap.elems sources
-        allRoles = actionRoles <> allTableRoles <> allLogicalModelRoles
+        -- All roles: from pre-computed per-pair source parsers plus action/remote-schema roles
+        allRoles = actionRoles <> HashMap.keysSet perPairParsers
 
-    contexts <-
-      -- Buld role contexts in parallel. We'd prefer deterministic parallelism
-      -- but that isn't really acheivable (see mono #3829). NOTE: the admin role
-      -- will still be a bottleneck here, even on huge_schema which has many
-      -- roles.
-      fmap HashMap.fromList
-        $ forConcurrentlyEIO 10 (Set.toList allRoles)
-        $ \role -> do
-          (role,)
-            <$> concurrentlyEIO
-              ( buildRoleContext
-                  sampledFeatureFlags
-                  (sqlGen, functionPermissions)
-                  sources
-                  allRemoteSchemas
-                  allActionInfos
-                  customTypes
-                  role
-                  remoteSchemaPermissions
-                  experimentalFeatures
-                  apolloFederationStatus
-                  mSchemaRegistryContext
-              )
-              ( buildRelayRoleContext
-                  (sqlGen, functionPermissions)
-                  sources
-                  allActionInfos
-                  customTypes
-                  role
-                  experimentalFeatures
-                  sampledFeatureFlags
-              )
-    let hasuraContexts = fst <$> contexts
-        relayContexts = snd <$> contexts
+    -- Relay contexts are nominally deferred with 'unsafeInterleaveIO', but in
+    -- practice the schema-cache build forces them on every rebuild (the deferral
+    -- does not hold — see @rfcs/per-schema-gql-context.md@ §12.11). The full Relay
+    -- schema spans every source/schema (its global @Node@ interface forbids
+    -- per-schema caching, so it cannot be incrementally rebuilt like the Hasura
+    -- schema) and costs O(total) seconds to assemble — dominating mutation latency
+    -- on large metadata. It is therefore **disabled by default**: only built when a
+    -- deployment opts in with the 'EFEnableRelaySchema' experimental feature.
+    -- When disabled, relay requests fall back to the (empty) unauthenticated relay
+    -- context. A build error surfaces as a 'RelayBuildException' when first forced.
+    relayContexts <-
+      if EFEnableRelaySchema `Set.member` experimentalFeatures
+        then
+          fmap HashMap.fromList
+            $ for (Set.toList allRoles)
+            $ \role -> do
+              lazyCtx <-
+                liftIO $ unsafeInterleaveIO $ do
+                  res <-
+                    runExceptT
+                      $ assembleRelayRoleContext
+                        (sqlGen, functionPermissions)
+                        sources
+                        allActionInfos
+                        customTypes
+                        role
+                        experimentalFeatures
+                        sampledFeatureFlags
+                  either (E.throwIO . RelayBuildException) pure res
+              pure (role, lazyCtx)
+        else pure mempty
 
-    adminIntrospection <-
-      case HashMap.lookup adminRoleName hasuraContexts of
-        Just (_context, _errors, introspection) -> pure introspection
+    -- The per-(role, pair) 'RoleContext' map.
+    let contexts :: HashMap RoleName (HashMap (SourceName, SchemaName) (RoleContext GQLContext))
+        contexts = fmap (fmap (view _1)) perRolePairContexts
+
+        -- All assembly inconsistencies, collected across every (role, pair).
+        assemblyErrors :: HashSet InconsistentMetadata
+        assemblyErrors =
+          Set.unions
+            $ concatMap (fmap (view _2) . HashMap.elems)
+            $ HashMap.elems perRolePairContexts
+
+    -- The admin role's per-pair results: required for the global admin
+    -- introspection (allowlist / query-collection validation, schema registry).
+    adminPairResults <-
+      case HashMap.lookup adminRoleName perRolePairContexts of
+        Just r -> pure r
         Nothing -> throw500 "buildGQLContext failed to build for the admin role"
-    (unauthenticated, unauthenticatedRemotesErrors) <- unauthenticatedContext (sqlGen, functionPermissions) sources allRemoteSchemas experimentalFeatures sampledFeatureFlags remoteSchemaPermissions
+    let adminIntrospection = mergeSchemaIntrospections $ view _3 <$> HashMap.elems adminPairResults
+
+    -- The unauthenticated context, per pair. Admin-only deployment (locked
+    -- decision 5): the unauthenticated universe equals the admin frontend
+    -- schema. It is only consulted for internal conflict introspection;
+    -- unauthenticated GraphQL access is gated upstream.
+    let unauthenticated :: HashMap (SourceName, SchemaName) GQLContext
+        unauthenticated = _rctxDefault <$> HashMap.findWithDefault mempty adminRoleName contexts
+
+    -- Routing index: top-level root-field name -> owning (source, schema). Built
+    -- from the admin role's parsers (the superset of visible root fields). A name
+    -- mapping to two different pairs is a naming-convention misconfiguration and
+    -- is surfaced as an inconsistency.
+    let adminPairParsers = HashMap.findWithDefault mempty adminRoleName perPairParsers
+        (rootFieldSchema, routingConflicts) = buildRootFieldIndex adminPairParsers
+
+    -- A single global unauthenticated context is required only by the (dormant)
+    -- Relay transport slot. Building it spans every source (it is NOT split per
+    -- pair), so it would re-run on every schema rebuild and defeat the
+    -- per-(source, schema) incremental win (§5.3). Defer it with
+    -- 'unsafeInterleaveIO' — exactly as 'relayContexts' above — so the O(total)
+    -- unauthenticated build only happens if the dormant Relay slot is ever
+    -- forced. With no remote schemas its error set is empty, so nothing needs to
+    -- be surfaced eagerly into 'assemblyErrors'.
+    relayUnauthenticated <-
+      liftIO $ unsafeInterleaveIO $ do
+        res <-
+          runExceptT
+            $ unauthenticatedContext (sqlGen, functionPermissions) sources allRemoteSchemas experimentalFeatures sampledFeatureFlags remoteSchemaPermissions
+        either (E.throwIO . RelayBuildException) (pure . fst) res
+
+    -- Per-role merged introspection for the schema registry.
+    let perRoleIntrospection :: HashMap RoleName G.SchemaIntrospection
+        perRoleIntrospection =
+          fmap (mergeSchemaIntrospections . fmap (view _3) . HashMap.elems) perRolePairContexts
 
     writeToSchemaRegistryAction <-
       forM mSchemaRegistryContext $ \schemaRegistryCtx -> do
@@ -207,7 +326,7 @@ buildGQLContext
             pure $ \_ _ _ ->
               unLogger logger $ mkGenericLog @Text LevelWarn "schema-registry" ("Failed to fetch the time from metadata db correctly: " <> showQErr err)
           Right now -> do
-            let schemaRegistryMap = generateSchemaRegistryMap hasuraContexts
+            let schemaRegistryMap = generateSchemaRegistryMap perRoleIntrospection
                 projectSchemaInfo = \metadataResourceVersion inconsistentMetadata metadata ->
                   ProjectGQLSchemaInformation
                     schemaRegistryMap
@@ -227,26 +346,78 @@ buildGQLContext
 
     pure
       ( ( adminIntrospection,
-          view _1 <$> hasuraContexts,
+          contexts,
           unauthenticated,
-          Set.unions $ unauthenticatedRemotesErrors : (view _2 <$> HashMap.elems hasuraContexts)
+          rootFieldSchema,
+          assemblyErrors <> Set.fromList routingConflicts
         ),
         ( relayContexts,
           -- Currently, remote schemas are exposed through Relay, but ONLY through
           -- the unauthenticated role.  This is probably an oversight.  See
           -- hasura/graphql-engine-mono#3883.
-          unauthenticated
+          relayUnauthenticated
         ),
         writeToSchemaRegistryAction
       )
     where
       checkMdErrs = not . null
 
-      generateSchemaRegistryMap :: HashMap RoleName RoleContextValue -> SchemaRegistryMap
+      generateSchemaRegistryMap :: HashMap RoleName G.SchemaIntrospection -> SchemaRegistryMap
       generateSchemaRegistryMap mpr =
-        flip HashMap.mapWithKey mpr $ \r (_, _, schemaIntrospection) ->
+        flip HashMap.mapWithKey mpr $ \r schemaIntrospection ->
           let schemaSdl = generateSDL schemaIntrospection
            in (GQLSchemaInformation (SchemaSDL schemaSdl) (calculateSchemaSDLHash schemaSdl r))
+
+      -- Union the per-pair introspection universes into one global universe.
+      mergeSchemaIntrospections :: [G.SchemaIntrospection] -> G.SchemaIntrospection
+      mergeSchemaIntrospections =
+        G.SchemaIntrospection . HashMap.unions . fmap (\(G.SchemaIntrospection m) -> m)
+
+      -- Build the rootField -> (source, schema) routing index from one role's
+      -- per-pair parsers, surfacing any name claimed by two different pairs as
+      -- an inconsistency (a naming-convention misconfiguration, see §4).
+      buildRootFieldIndex ::
+        HashMap (SourceName, SchemaName) SchemaFieldParsers ->
+        (HashMap G.Name (SourceName, SchemaName), [InconsistentMetadata])
+      buildRootFieldIndex pairParsers =
+        foldl' insertName (mempty, []) entries
+        where
+          entries =
+            [ (name, pair)
+              | (pair, parsers) <- HashMap.toList pairParsers,
+                name <- pairRootFieldNames parsers
+            ]
+          insertName (idx, conflicts) (name, pair) =
+            case HashMap.lookup name idx of
+              Just existing
+                | existing /= pair ->
+                    (idx, routingConflict name existing pair : conflicts)
+              _ -> (HashMap.insert name pair idx, conflicts)
+
+      pairRootFieldNames :: SchemaFieldParsers -> [G.Name]
+      pairRootFieldNames SchemaFieldParsers {..} =
+        fmap (P.dName . P.fDefinition) _sfpQuery
+          <> fmap (P.dName . P.fDefinition) _sfpMutFrontend
+          <> fmap (P.dName . P.fDefinition) _sfpMutBackend
+          <> fmap (P.dName . P.fDefinition) _sfpSubscription
+
+      routingConflict :: G.Name -> (SourceName, SchemaName) -> (SourceName, SchemaName) -> InconsistentMetadata
+      routingConflict name (srcA, schA) (srcB, schB) =
+        InconsistentObject
+          ( "root field "
+              <> toTxt name
+              <> " is generated by multiple (source, schema) pairs: ("
+              <> toTxt srcA
+              <> ", "
+              <> getSchemaTxt schA
+              <> ") and ("
+              <> toTxt srcB
+              <> ", "
+              <> getSchemaTxt schB
+              <> "); type/root-field naming must uniquely encode (source, schema)"
+          )
+          Nothing
+          (MetadataObject (MOSource srcB) (J.toJSON name))
 
 buildSchemaOptions ::
   (SQLGenCtx, Options.InferFunctionPermissions) ->
@@ -290,8 +461,10 @@ buildSchemaOptions
           removeEmptySubscriptionResponses
       }
 
--- | Build the @QueryHasura@ context for a given role.
-buildRoleContext ::
+-- | Assemble the per-role GQL context from pre-computed source parsers plus
+-- actions, remote schemas, and introspection.  Extracted from 'buildRoleContext'
+-- so the source-parser computation can be lifted out of the assembly loop.
+assembleGQLContext ::
   forall m.
   (MonadError QErr m, MonadIO m) =>
   SchemaSampledFeatureFlags ->
@@ -305,8 +478,9 @@ buildRoleContext ::
   Set.HashSet ExperimentalFeature ->
   ApolloFederationStatus ->
   Maybe SchemaRegistryContext ->
+  SchemaFieldParsers ->
   m RoleContextValue
-buildRoleContext sampledFeatureFlags options sources remotes actions customTypes role remoteSchemaPermsCtx expFeatures apolloFederationStatus mSchemaRegistryContext = do
+assembleGQLContext sampledFeatureFlags options sources remotes actions customTypes role remoteSchemaPermsCtx expFeatures apolloFederationStatus mSchemaRegistryContext sourceParsers = do
   let schemaOptions = buildSchemaOptions options expFeatures
       schemaContext =
         SchemaContext
@@ -321,13 +495,13 @@ buildRoleContext sampledFeatureFlags options sources remotes actions customTypes
           )
           role
           sampledFeatureFlags
+      -- Unpack the pre-computed source parsers
+      sourcesQueryFields = _sfpQuery sourceParsers
+      sourcesMutationFrontendFields = _sfpMutFrontend sourceParsers
+      sourcesMutationBackendFields = _sfpMutBackend sourceParsers
+      sourcesSubscriptionFields = _sfpSubscription sourceParsers
+      apolloFedTableParsers = _sfpApolloFed sourceParsers
   runMemoizeT $ do
-    -- build all sources (`apolloFedTableParsers` contains all the parsers and
-    -- type names, which are eligible for the `_Entity` Union)
-    (sourcesQueryFields, sourcesMutationFrontendFields, sourcesMutationBackendFields, sourcesSubscriptionFields, apolloFedTableParsers) <-
-      fmap mconcat $ for (toList sources) \sourceInfo ->
-        AB.dispatchAnyBackend @BackendSchema sourceInfo $ buildSource schemaContext schemaOptions
-
     -- build all actions
     -- we use the source context due to how async query relationships are implemented
     (actionsQueryFields, actionsMutationFields, actionsSubscriptionFields) <-
@@ -387,12 +561,18 @@ buildRoleContext sampledFeatureFlags options sources remotes actions customTypes
               else G.SchemaIntrospection mempty
           Just _ -> result
 
-    void
-      . throwOnConflictingDefinitions
-      $ buildIntrospectionSchema
-        (P.parserType queryParserFrontend)
-        (P.parserType <$> mutationParserFrontend)
-        (P.parserType <$> subscriptionParser)
+    -- We deliberately do NOT run a second conflicting-definitions check on the
+    -- frontend schema: the backend check above already subsumes it. The frontend
+    -- schema is a strict subset of the backend one. Every Scenario guard in
+    -- Hasura.GraphQL.Schema.* has the shape "not (scenario == Frontend and
+    -- backendOnly)", so Frontend only ever removes backend_only mutation fields;
+    -- nothing is frontend-only and the query/subscription roots are identical.
+    -- Hence every type reachable from the frontend roots is reachable from the
+    -- backend roots with the same definition, and a name conflict could not arise
+    -- in the frontend without also arising in the backend (a subset of a
+    -- conflict-free type set is conflict-free). Re-collecting the whole type
+    -- universe a second time measured ~56ms/build on a ~600-table schema (~44% of
+    -- per-pair context assembly) for a check that can never fire independently.
 
     -- (since we're running this in parallel in caller, be strict)
     let !frontendContext =
@@ -411,50 +591,261 @@ buildRoleContext sampledFeatureFlags options sources remotes actions customTypes
         remoteSchemaErrors,
         introspectionSchema
       )
-  where
-    buildSource ::
-      forall b.
-      (BackendSchema b) =>
-      SchemaContext ->
-      SchemaOptions ->
-      SourceInfo b ->
-      MemoizeT
-        m
-        ( [FieldParser P.Parse (NamespacedField (QueryRootField UnpreparedValue))], -- query fields
-          [FieldParser P.Parse (NamespacedField (MutationRootField UnpreparedValue))], -- mutation backend fields
-          [FieldParser P.Parse (NamespacedField (MutationRootField UnpreparedValue))], -- mutation frontend fields
-          [FieldParser P.Parse (NamespacedField (QueryRootField UnpreparedValue))], -- subscription fields
-          [(G.Name, Parser 'Output P.Parse (ApolloFederationParserFunction P.Parse))] -- apollo federation tables
-        )
-    buildSource schemaContext schemaOptions sourceInfo@(SourceInfo {..}) =
-      runSourceSchema schemaContext schemaOptions sourceInfo do
-        let validFunctions = takeValidFunctions _siFunctions
-            validNativeQueries = takeValidNativeQueries _siNativeQueries
-            validStoredProcedures = takeValidStoredProcedures _siStoredProcedures
-            validTables = takeValidTables _siTables
-            mkRootFieldName = _rscRootFields _siCustomization
-            makeTypename = SC._rscTypeNames _siCustomization
-        (uncustomizedQueryRootFields, uncustomizedSubscriptionRootFields, apolloFedTableParsers) <-
-          buildQueryAndSubscriptionFields mkRootFieldName sourceInfo validTables validFunctions validNativeQueries validStoredProcedures
-        (,,,,apolloFedTableParsers)
-          <$> customizeFields
-            _siCustomization
-            (makeTypename <> MkTypename (<> Name.__query))
-            (pure uncustomizedQueryRootFields)
-          <*> customizeFields
-            _siCustomization
-            (makeTypename <> MkTypename (<> Name.__mutation_frontend))
-            (buildMutationFields mkRootFieldName Frontend sourceInfo validTables validFunctions)
-          <*> customizeFields
-            _siCustomization
-            (makeTypename <> MkTypename (<> Name.__mutation_backend))
-            (buildMutationFields mkRootFieldName Backend sourceInfo validTables validFunctions)
-          <*> customizeFields
-            _siCustomization
-            (makeTypename <> MkTypename (<> Name.__subscription))
-            (pure uncustomizedSubscriptionRootFields)
 
-buildRelayRoleContext ::
+-- | Assemble every role's 'GQLContext' for a single @(source, schema)@ pair from
+-- that pair's per-role field parsers (§5.3). This is the expensive,
+-- introspection-heavy step ('assembleGQLContext' per role); running it here —
+-- inside the per-(source, schema) 'Inc.cache' node — is what makes a mutation to
+-- one pair re-assemble only that pair. With locked decisions (1) actions /
+-- remote schemas / custom types are empty and (3) each pair is self-contained,
+-- so the action/remote/custom-type inputs are passed empty.
+assemblePerPairContexts ::
+  forall m.
+  (MonadError QErr m, MonadIO m) =>
+  SchemaSampledFeatureFlags ->
+  (SQLGenCtx, Options.InferFunctionPermissions) ->
+  SourceCache ->
+  Options.RemoteSchemaPermissions ->
+  Set.HashSet ExperimentalFeature ->
+  ApolloFederationStatus ->
+  Maybe SchemaRegistryContext ->
+  HashMap RoleName SchemaFieldParsers ->
+  m (HashMap RoleName RoleContextValue)
+assemblePerPairContexts sampledFeatureFlags options sources remoteSchemaPermsCtx expFeatures apolloFederationStatus mSchemaRegistryContext roleParsers =
+  fmap HashMap.fromList
+    $ for (HashMap.toList roleParsers)
+    $ \(role, parsers) ->
+      (role,)
+        <$> assembleGQLContext
+          sampledFeatureFlags
+          options
+          sources
+          mempty
+          []
+          mempty
+          role
+          remoteSchemaPermsCtx
+          expFeatures
+          apolloFederationStatus
+          mSchemaRegistryContext
+          parsers
+
+-- | Partition a 'SourceInfo b' into per-DB-schema slices so that each slice
+-- can be fed independently into 'buildSchemaRoleParsers'.  Tables and functions
+-- are assigned to their own schema; native queries (no schema component) are
+-- assigned only to the first schema alphabetically.
+partitionSourceBySchema ::
+  forall b.
+  (BackendMetadata b) =>
+  SourceInfo b ->
+  HashMap SchemaName (SourceInfo b)
+partitionSourceBySchema si@SourceInfo {..} =
+  HashMap.mapWithKey buildSlice allSchemas
+  where
+    tableSchemas =
+      HashMap.fromListWith (\_ x -> x)
+        [(tableNameSchema @b tn, ()) | tn <- HashMap.keys _siTables]
+    functionSchemas =
+      HashMap.fromListWith (\_ x -> x)
+        [(functionNameSchema @b fn, ()) | fn <- HashMap.keys _siFunctions]
+    storedProcSchemas =
+      HashMap.fromListWith (\_ x -> x)
+        [(functionNameSchema @b fn, ()) | fn <- HashMap.keys _siStoredProcedures]
+    allSchemas = tableSchemas <> functionSchemas <> storedProcSchemas
+
+    -- Native queries have no schema component; assign them to the first schema.
+    firstSchema = listToMaybe $ sort $ HashMap.keys allSchemas
+
+    buildSlice schemaName _ =
+      si
+        { _siTables =
+            HashMap.filterWithKey (\tn _ -> tableNameSchema @b tn == schemaName) _siTables,
+          _siFunctions =
+            HashMap.filterWithKey (\fn _ -> functionNameSchema @b fn == schemaName) _siFunctions,
+          _siStoredProcedures =
+            HashMap.filterWithKey (\fn _ -> functionNameSchema @b fn == schemaName) _siStoredProcedures,
+          -- Native queries go to the first schema only; empty for all others.
+          _siNativeQueries =
+            if Just schemaName == firstSchema then _siNativeQueries else mempty,
+          -- Logical models are referenced by name only; include in all slices.
+          _siLogicalModels = _siLogicalModels
+        }
+
+-- | Build 'SchemaFieldParsers' for a single role using a schema-partitioned
+-- 'SourceInfo b'.  Analogous to the local @buildSource@ in 'buildRoleContext'
+-- but returns the structured 'SchemaFieldParsers' rather than a raw 5-tuple.
+buildSchemaRoleParsers ::
+  forall b m.
+  (BackendSchema b, MonadError QErr m, MonadIO m) =>
+  -- | Phase 9 per-table field cache; 'noTableFieldsCache' rebuilds everything.
+  TableFieldsCacher b ->
+  -- | Hasura schema context (HasuraSchema kind, remote relationships enabled)
+  SchemaContext ->
+  SchemaOptions ->
+  SourceInfo b ->
+  MemoizeT m SchemaFieldParsers
+buildSchemaRoleParsers cacher hasuraSchemaContext schemaOptions sourceInfo@(SourceInfo {..}) =
+  runSourceSchema hasuraSchemaContext schemaOptions sourceInfo do
+    let validFunctions = takeValidFunctions _siFunctions
+        validNativeQueries = takeValidNativeQueries _siNativeQueries
+        validStoredProcedures = takeValidStoredProcedures _siStoredProcedures
+        validTables = takeValidTables _siTables
+        mkRootFieldName = _rscRootFields _siCustomization
+        makeTypename = SC._rscTypeNames _siCustomization
+    (uncustomizedQueryFs, uncustomizedSubFs, apolloFed) <-
+      buildQueryAndSubscriptionFields cacher mkRootFieldName sourceInfo validTables validFunctions validNativeQueries validStoredProcedures
+    qFs <-
+      customizeFields
+        _siCustomization
+        (makeTypename <> MkTypename (<> Name.__query))
+        (pure uncustomizedQueryFs)
+    mutFE <-
+      customizeFields
+        _siCustomization
+        (makeTypename <> MkTypename (<> Name.__mutation_frontend))
+        (buildMutationFields cacher mkRootFieldName Frontend sourceInfo validTables validFunctions)
+    mutBE <-
+      customizeFields
+        _siCustomization
+        (makeTypename <> MkTypename (<> Name.__mutation_backend))
+        (buildMutationFields cacher mkRootFieldName Backend sourceInfo validTables validFunctions)
+    sFs <-
+      customizeFields
+        _siCustomization
+        (makeTypename <> MkTypename (<> Name.__subscription))
+        (pure uncustomizedSubFs)
+    pure
+      SchemaFieldParsers
+        { _sfpQuery = qFs,
+          _sfpMutFrontend = mutFE,
+          _sfpMutBackend = mutBE,
+          _sfpSubscription = sFs,
+          _sfpApolloFed = apolloFed
+        }
+
+-- | Build the Relay per-source field parsers for a single schema partition.
+--
+-- This is exactly the local @buildSource@ helper that used to live inside
+-- 'buildRelayRoleContext', scoped to one DB schema so it is memoised per
+-- (source, DB schema). It MUST be run in its own 'runMemoizeT', separate from
+-- 'buildSchemaRoleParsers': 'defaultTableSelectionSet' memoises on
+-- @(sourceName, tableName)@ only (not on the schema kind), so sharing a memo
+-- table with the Hasura build would make the Relay connection's @edges.node@
+-- reuse the Hasura (non-@Node@) selection set, producing conflicting
+-- definitions against the top-level @node@ field. The top-level @node@ field /
+-- @Node@ interface are NOT built here (they are cross-schema); they are added
+-- once per role in 'assembleRelayRoleContext'.
+buildSchemaRelayParsers ::
+  forall b m.
+  (BackendSchema b, MonadError QErr m, MonadIO m) =>
+  -- | Relay schema context (RelaySchema kind, remote relationships ignored)
+  SchemaContext ->
+  SchemaOptions ->
+  SourceInfo b ->
+  MemoizeT
+    m
+    ( [FieldParser P.Parse (NamespacedField (QueryRootField UnpreparedValue))],
+      [FieldParser P.Parse (NamespacedField (MutationRootField UnpreparedValue))],
+      [FieldParser P.Parse (NamespacedField (MutationRootField UnpreparedValue))],
+      [FieldParser P.Parse (NamespacedField (QueryRootField UnpreparedValue))]
+    )
+buildSchemaRelayParsers relaySchemaContext schemaOptions sourceInfo@(SourceInfo {..}) =
+  runSourceSchema relaySchemaContext schemaOptions sourceInfo do
+    let validFunctions = takeValidFunctions _siFunctions
+        validTables = takeValidTables _siTables
+        mkRootFieldName = _rscRootFields _siCustomization
+        makeTypename = SC._rscTypeNames _siCustomization
+    (uncustomizedRelayQueryFs, uncustomizedRelaySubFs) <-
+      buildRelayQueryAndSubscriptionFields mkRootFieldName sourceInfo validTables validFunctions
+    (,,,)
+      <$> customizeFields
+        _siCustomization
+        (makeTypename <> MkTypename (<> Name.__query))
+        (pure uncustomizedRelayQueryFs)
+      <*> customizeFields
+        _siCustomization
+        (makeTypename <> MkTypename (<> Name.__mutation_frontend))
+        (buildMutationFields noTableFieldsCache mkRootFieldName Frontend sourceInfo validTables validFunctions)
+      <*> customizeFields
+        _siCustomization
+        (makeTypename <> MkTypename (<> Name.__mutation_backend))
+        (buildMutationFields noTableFieldsCache mkRootFieldName Backend sourceInfo validTables validFunctions)
+      <*> customizeFields
+        _siCustomization
+        (makeTypename <> MkTypename (<> Name.__subscription))
+        (pure uncustomizedRelaySubFs)
+
+-- | Build per-role 'SchemaFieldParsers' for all roles using a single
+-- schema-partitioned 'SourceInfo b'.  Builds a fresh 'SchemaContext' for each
+-- role so that permission checks are applied correctly.
+buildAllRoleParsersForSchema ::
+  forall b m.
+  (BackendSchema b, MonadError QErr m, MonadIO m) =>
+  -- | Per-table field caches, or 'Nothing' to rebuild every table unconditionally.
+  -- Populated by default; 'Nothing' is the 'EFDisablePerTableSchemaCache' escape
+  -- hatch and the pre-Phase-9 behaviour.
+  Maybe TableFieldStore ->
+  -- | The DB schema this partition covers; part of the cache's key.
+  SchemaName ->
+  -- | Per-table content fingerprints, computed once by the caller and shared with
+  -- the 'Inc.cache' key that gates this build (§10.2). These decide which tables
+  -- changed; 'tableDependencyGraph' expands that into the set to rebuild.
+  HashMap (TableName b) J.Value ->
+  SchemaSampledFeatureFlags ->
+  SchemaOptions ->
+  SourceCache ->
+  HashMap RemoteSchemaName RemoteSchemaCtx ->
+  Options.RemoteSchemaPermissions ->
+  [RoleName] ->
+  SourceInfo b ->
+  m (HashMap RoleName SchemaFieldParsers)
+buildAllRoleParsersForSchema mTableFieldStore schemaName tableFingerprints sampledFeatureFlags schemaOptions sources remotes remoteSchemaPermsCtx roles filteredSi = do
+  let dependencyGraph = tableDependencyGraph @b (_siTables filteredSi)
+  fmap HashMap.fromList $ for roles $ \role -> do
+    let hasuraSchemaContext =
+          SchemaContext
+            HasuraSchema
+            ( remoteRelationshipField
+                hasuraSchemaContext
+                schemaOptions
+                sources
+                remotes
+                remoteSchemaPermsCtx
+                IncludeRemoteSourceRelationship
+            )
+            role
+            sampledFeatureFlags
+    -- Only the Hasura query/mutation/subscription parsers are schema-partitioned
+    -- and cached here. The Relay schema is built separately, once per role, in
+    -- 'assembleRelayRoleContext' (see the note on 'SchemaFieldParsers'): its
+    -- global 'Node' interface cannot be split across per-schema memoize tables
+    -- without producing conflicting type definitions.
+    -- Phase 9: with a store, an unchanged table's builders are never called; the
+    -- cache is consulted above them, so there is no key to compute and no memo
+    -- table to probe. 'Nothing' rebuilds every table (the default).
+    cacher <- case mTableFieldStore of
+      Nothing -> pure noTableFieldsCache
+      Just store -> do
+        let pairKey = (_siName filteredSi, schemaName, role)
+        -- MUST precede any withTableFields call for this pair: it is what drops the
+        -- entries a change invalidated.
+        _stats <- prepareForBuild @b store pairKey dependencyGraph tableFingerprints
+        pure $ mkTableFieldsCacher @b store pairKey
+    hasuraParsers <- runMemoizeT $ buildSchemaRoleParsers cacher hasuraSchemaContext schemaOptions filteredSi
+    pure (role, hasuraParsers)
+
+-- | Assemble the per-role Relay 'RoleContext'.
+--
+-- Unlike the Hasura schema (which is built per (source, DB schema) and cached
+-- in 'buildSchemaRoleParsers'), the Relay schema is built here in full, once per
+-- role, in a SINGLE 'runMemoizeT'. This is mandatory: the Relay @Node@ interface
+-- (and @PageInfo@ etc.) is a single global type whose '_ifObjects' spans every
+-- relay-enabled table across all sources/schemas. Building the per-source/-schema
+-- connection types in separate memoize tables would mint divergent @Node@
+-- definitions and fail with "conflicting definitions for GraphQL type 'Node'".
+-- The per-source Relay fields are built by 'buildSchemaRelayParsers' over the
+-- full 'SourceCache' inside the same memoize pass as 'nodeField'/'nodeInterface'.
+assembleRelayRoleContext ::
   forall m.
   (MonadError QErr m, MonadIO m) =>
   (SQLGenCtx, Options.InferFunctionPermissions) ->
@@ -465,7 +856,7 @@ buildRelayRoleContext ::
   Set.HashSet ExperimentalFeature ->
   SchemaSampledFeatureFlags ->
   m (RoleContext GQLContext)
-buildRelayRoleContext options sources actions customTypes role expFeatures schemaSampledFeatureFlags = do
+assembleRelayRoleContext options sources actions customTypes role expFeatures schemaSampledFeatureFlags = do
   let schemaOptions = buildSchemaOptions options expFeatures
       -- TODO: At the time of writing this, remote schema queries are not supported in relay.
       -- When they are supported, we should get do what `buildRoleContext` does. Since, they
@@ -479,14 +870,12 @@ buildRelayRoleContext options sources actions customTypes role expFeatures schem
           role
           schemaSampledFeatureFlags
   runMemoizeT do
-    -- build all sources, and the node root
-    (node, fieldsList) <- do
-      node <- fmap NotNamespaced <$> nodeField sources schemaContext schemaOptions
-      fieldsList <-
-        for (toList sources) \sourceInfo ->
-          AB.dispatchAnyBackend @BackendSchema sourceInfo (buildSource schemaContext schemaOptions)
-      pure (node, fieldsList)
-
+    -- Build the global @node@ root AND every source's Relay fields in this single
+    -- memoize table, so the cross-schema @Node@ interface is constructed exactly once.
+    node <- fmap NotNamespaced <$> nodeField sources schemaContext schemaOptions
+    fieldsList <-
+      for (toList sources) \exists ->
+        AB.dispatchAnyBackend @BackendSchema exists (buildSchemaRelayParsers schemaContext schemaOptions)
     let (queryFields, mutationFrontendFields, mutationBackendFields, subscriptionFields) = mconcat fieldsList
         allQueryFields = node : queryFields
         allSubscriptionFields = node : subscriptionFields
@@ -539,45 +928,6 @@ buildRelayRoleContext options sources actions customTypes role expFeatures schem
             (finalizeParser <$> subscriptionParser)
 
     pure $ RoleContext frontendContext $ Just backendContext
-  where
-    buildSource ::
-      forall b.
-      (BackendSchema b) =>
-      SchemaContext ->
-      SchemaOptions ->
-      SourceInfo b ->
-      MemoizeT
-        m
-        ( [FieldParser P.Parse (NamespacedField (QueryRootField UnpreparedValue))],
-          [FieldParser P.Parse (NamespacedField (MutationRootField UnpreparedValue))],
-          [FieldParser P.Parse (NamespacedField (MutationRootField UnpreparedValue))],
-          [FieldParser P.Parse (NamespacedField (QueryRootField UnpreparedValue))]
-        )
-    buildSource schemaContext schemaOptions sourceInfo@(SourceInfo {..}) = do
-      runSourceSchema schemaContext schemaOptions sourceInfo do
-        let validFunctions = takeValidFunctions _siFunctions
-            validTables = takeValidTables _siTables
-            mkRootFieldName = _rscRootFields _siCustomization
-            makeTypename = SC._rscTypeNames _siCustomization
-        (uncustomizedQueryRootFields, uncustomizedSubscriptionRootFields) <-
-          buildRelayQueryAndSubscriptionFields mkRootFieldName sourceInfo validTables validFunctions
-        (,,,)
-          <$> customizeFields
-            _siCustomization
-            (makeTypename <> MkTypename (<> Name.__query))
-            (pure uncustomizedQueryRootFields)
-          <*> customizeFields
-            _siCustomization
-            (makeTypename <> MkTypename (<> Name.__mutation_frontend))
-            (buildMutationFields mkRootFieldName Frontend sourceInfo validTables validFunctions)
-          <*> customizeFields
-            _siCustomization
-            (makeTypename <> MkTypename (<> Name.__mutation_backend))
-            (buildMutationFields mkRootFieldName Backend sourceInfo validTables validFunctions)
-          <*> customizeFields
-            _siCustomization
-            (makeTypename <> MkTypename (<> Name.__subscription))
-            (pure uncustomizedSubscriptionRootFields)
 
 -- | Builds the schema context for unauthenticated users.
 --
@@ -767,7 +1117,10 @@ buildRemoteSchemaParser remoteSchemaPermsCtx roleName context = do
 --   subscription field parsers.
 buildQueryAndSubscriptionFields ::
   forall b r m n.
-  (MonadBuildSchema b r m n) =>
+  (MonadBuildSchema b r m n, MonadIO m, Typeable n) =>
+  -- | Phase 9: reuses an unchanged table's fields instead of rebuilding them.
+  -- 'noTableFieldsCache' is the pre-Phase-9 behaviour.
+  TableFieldsCacher b ->
   MkRootFieldName ->
   SourceInfo b ->
   TableCache b ->
@@ -781,7 +1134,7 @@ buildQueryAndSubscriptionFields ::
       [P.FieldParser n (SubscriptionRootField UnpreparedValue)],
       [(G.Name, Parser 'Output n (ApolloFederationParserFunction n))]
     )
-buildQueryAndSubscriptionFields mkRootFieldName sourceInfo tables (takeExposedAs FEAQuery -> functions) nativeQueries storedProcedures = do
+buildQueryAndSubscriptionFields cacher mkRootFieldName sourceInfo tables (takeExposedAs FEAQuery -> functions) nativeQueries storedProcedures = do
   roleName <- retrieve scRole
   functionPermsCtx <- retrieve Options.soInferFunctionPermissions
   functionSelectExpParsers <-
@@ -806,9 +1159,12 @@ buildQueryAndSubscriptionFields mkRootFieldName sourceInfo tables (takeExposedAs
   (tableQueryFields, tableSubscriptionFields, apolloFedTableParsers) <-
     unzip3
       . catMaybes
-      <$> for (HashMap.toList tables) \(tableName, tableInfo) -> runMaybeT $ do
-        tableIdentifierName <- getTableIdentifierName @b tableInfo
-        lift $ buildTableQueryAndSubscriptionFields mkRootFieldName tableName tableInfo tableIdentifierName
+      <$> for (HashMap.toList tables) \(tableName, tableInfo) ->
+        -- The cache wraps the whole per-table build, including
+        -- getTableIdentifierName: the point is to skip the walk, not just its tail.
+        runTableFieldsCacher cacher "query" tableName $ runMaybeT $ do
+          tableIdentifierName <- getTableIdentifierName @b tableInfo
+          lift $ buildTableQueryAndSubscriptionFields mkRootFieldName tableName tableInfo tableIdentifierName
 
   let tableQueryRootFields = fmap mkRF $ concat tableQueryFields
       tableSubscriptionRootFields = fmap mkRF $ concat tableSubscriptionFields
@@ -932,16 +1288,22 @@ buildRelayQueryAndSubscriptionFields mkRootFieldName sourceInfo tables (takeExpo
 
 buildMutationFields ::
   forall b r m n.
-  (MonadBuildSchema b r m n) =>
+  (MonadBuildSchema b r m n, MonadIO m, Typeable n) =>
+  TableFieldsCacher b ->
   MkRootFieldName ->
   Scenario ->
   SourceInfo b ->
   TableCache b ->
   FunctionCache b ->
   SchemaT r m [P.FieldParser n (MutationRootField UnpreparedValue)]
-buildMutationFields mkRootFieldName scenario sourceInfo tables (takeExposedAs FEAMutation -> functions) = do
+buildMutationFields cacher mkRootFieldName scenario sourceInfo tables (takeExposedAs FEAMutation -> functions) = do
   roleName <- retrieve scRole
-  tableMutations <- for (HashMap.toList tables) \(tableName, tableInfo) -> do
+  -- Frontend and Backend produce different fields for the same table, so they must
+  -- not share a cache slot.
+  let mutationSlot = case scenario of
+        Frontend -> "mutation-frontend"
+        Backend -> "mutation-backend"
+  tableMutations <- for (HashMap.toList tables) \(tableName, tableInfo) -> runTableFieldsCacher cacher mutationSlot tableName do
     tableIdentifierName <- getTableIdentifierName @b tableInfo
     inserts <-
       mkRFs (MDBR . MDBInsert) $ buildTableInsertMutationFields mkRootFieldName scenario tableName tableInfo tableIdentifierName

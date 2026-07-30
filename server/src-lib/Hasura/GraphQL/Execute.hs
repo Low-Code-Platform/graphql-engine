@@ -4,6 +4,7 @@ module Hasura.GraphQL.Execute
     ET.GraphQLQueryType (..),
     getResolvedExecPlan,
     makeGQLContext,
+    resolveTargetSchema,
     execRemoteGQ,
     SubscriptionExecution (..),
     buildSubscriptionPlan,
@@ -26,9 +27,12 @@ import Data.HashSet qualified as HS
 import Data.List (elemIndex)
 import Data.Monoid (Endo (..))
 import Data.Tagged qualified as Tagged
+import Data.Text.NonEmpty (mkNonEmptyText)
+import Data.Text qualified as T
 import Hasura.Authentication.Role (adminRoleName)
 import Hasura.Authentication.User (BackendOnlyFieldAccess (..), UserInfo (..))
 import Hasura.Backends.Postgres.Execute.Types
+import Hasura.Backends.Postgres.SQL.Types (SchemaName (..))
 import Hasura.Base.Error
 import Hasura.EncJSON
 import Hasura.GraphQL.Context qualified as C
@@ -71,31 +75,99 @@ import Hasura.Tracing qualified as Tracing
 import Language.GraphQL.Draft.Syntax qualified as G
 import Network.HTTP.Types qualified as HTTP
 
--- | Construct a single step of an execution plan.
+-- | Look up the per-(source, schema) GraphQL context that a resolved request
+-- targets. Returns 'Nothing' when the requested pair has no context available
+-- for this role (the caller surfaces an error).
 makeGQLContext ::
   UserInfo ->
   SchemaCache ->
   ET.GraphQLQueryType ->
-  C.GQLContext
-makeGQLContext userInfo sc queryType =
-  case HashMap.lookup role contextMap of
-    Nothing -> defaultContext
-    Just (C.RoleContext frontend backend) ->
+  (SourceName, SchemaName) ->
+  Maybe C.GQLContext
+makeGQLContext userInfo sc queryType targetPair =
+  case queryType of
+    -- Relay is built globally (its 'Node' interface spans every pair), so the
+    -- per-(source, schema) selector is ignored here.
+    ET.QueryRelay ->
+      Just $ case HashMap.lookup role (scRelayContext sc) of
+        Nothing -> scUnauthenticatedRelayContext sc
+        Just roleContext -> pickContext roleContext
+    ET.QueryHasura ->
+      case HashMap.lookup role (scGQLContext sc) >>= HashMap.lookup targetPair of
+        Just roleContext -> Just $ pickContext roleContext
+        Nothing -> HashMap.lookup targetPair (scUnauthenticatedGQLContext sc)
+  where
+    role = _uiRole userInfo
+    pickContext (C.RoleContext frontend backend) =
       case _uiBackendOnlyFieldAccess userInfo of
         BOFAAllowed -> fromMaybe frontend backend
         BOFADisallowed -> frontend
+
+-- | Resolve which @(source, schema)@ GraphQL context an operation targets
+-- (Phase 1 routing, see @per-schema-gql-context.md@ §4).
+--
+--   * Data operations route by their top-level root-field names via the
+--     gen-time routing index ('scRootFieldSchema'). All data fields must agree
+--     on a single pair (guaranteed by the no-cross-schema invariant); an
+--     unknown field is an error.
+--   * Introspection / meta-only operations (only @__@-prefixed top-level
+--     fields) carry no schema-specific field, so they select the pair via the
+--     @x-hasura-source@ / @x-hasura-schema@ headers, falling back to the
+--     configured @HASURA_GRAPHQL_DEFAULT_SOURCE@ / @HASURA_GRAPHQL_DEFAULT_SCHEMA@
+--     defaults and, if those are unset, the first pair alphabetically.
+resolveTargetSchema ::
+  (MonadError QErr m) =>
+  -- | Configured @(default source, default schema)@ from the serve options.
+  (Maybe SourceName, Maybe SchemaName) ->
+  SchemaCache ->
+  [HTTP.Header] ->
+  SingleOperation ->
+  m (SourceName, SchemaName)
+resolveTargetSchema (defaultSourceConf, defaultSchemaConf) sc reqHeaders operation = do
+  let topLevelNames = mapMaybe topLevelFieldName (G._todSelectionSet operation)
+      dataFieldNames = filter (not . isMetaField) topLevelNames
+  case dataFieldNames of
+    [] -> resolveFromHeaders
+    _ -> do
+      pairs <- for dataFieldNames $ \fieldName ->
+        HashMap.lookup fieldName (scRootFieldSchema sc)
+          `onNothing` throw400
+            ValidationFailed
+            ("root field " <> G.unName fieldName <> " is not part of any GraphQL schema")
+      case nubOrd pairs of
+        [pair] -> pure pair
+        [] -> resolveFromHeaders
+        _ ->
+          throw400
+            ValidationFailed
+            "a single operation cannot span multiple (source, schema) GraphQL schemas"
   where
-    role = _uiRole userInfo
+    allPairs = sort $ HashMap.keys (scUnauthenticatedGQLContext sc)
 
-    contextMap =
-      case queryType of
-        ET.QueryHasura -> scGQLContext sc
-        ET.QueryRelay -> scRelayContext sc
+    isMetaField name = "__" `T.isPrefixOf` G.unName name
 
-    defaultContext =
-      case queryType of
-        ET.QueryHasura -> scUnauthenticatedGQLContext sc
-        ET.QueryRelay -> scUnauthenticatedRelayContext sc
+    topLevelFieldName = \case
+      G.SelectionField field -> Just (G._fName field)
+      _ -> Nothing
+
+    headerText name =
+      listToMaybe [bsToTxt v | (k, v) <- reqHeaders, k == name]
+
+    -- Resolve source and schema independently: an explicit header wins, then
+    -- the configured default, then (if neither yields a complete pair) the
+    -- first available pair alphabetically.
+    resolveFromHeaders =
+      let mSource = (parseSourceName =<< headerText "x-hasura-source") <|> defaultSourceConf
+          mSchema = (SchemaName <$> headerText "x-hasura-schema") <|> defaultSchemaConf
+       in case (mSource, mSchema) of
+            (Just source, Just schema) -> pure (source, schema)
+            _ -> case allPairs of
+              (pair : _) -> pure pair
+              [] -> throw400 NotFound "no GraphQL schema is available"
+
+    parseSourceName t
+      | t == sourceNameToText defaultSource = Just defaultSource
+      | otherwise = SNName <$> mkNonEmptyText t
 
 -- The graphql query is resolved into a sequence of execution operations
 data ResolvedExecutionPlan
@@ -369,6 +441,8 @@ getResolvedExecPlan ::
   Init.ResponseInternalErrorsConfig ->
   HeaderPrecedence ->
   TraceQueryStatus ->
+  -- | Configured @(default source, default schema)@ from the serve options.
+  (Maybe SourceName, Maybe SchemaName) ->
   m (ParameterizedQueryHash, ResolvedExecutionPlan, [ModelInfoPart])
 getResolvedExecPlan
   env
@@ -386,9 +460,19 @@ getResolvedExecPlan
   reqId
   responseErrorsConfig
   headerPrecedence
-  traceQueryStatus = do
-    let gCtx = makeGQLContext userInfo sc queryType
-        tracesPropagator = getOtelTracesPropagator $ scOpenTelemetryConfig sc
+  traceQueryStatus
+  defaultGqlSchema = do
+    targetPair <- resolveTargetSchema defaultGqlSchema sc reqHeaders queryParts
+    gCtx <-
+      makeGQLContext userInfo sc queryType targetPair
+        `onNothing` throw400
+          NotFound
+          ( "no GraphQL schema for source "
+              <> sourceNameToText (fst targetPair)
+              <> ", schema "
+              <> getSchemaTxt (snd targetPair)
+          )
+    let tracesPropagator = getOtelTracesPropagator $ scOpenTelemetryConfig sc
         includeInternalErrors = Init.shouldIncludeInternal (_uiRole userInfo) responseErrorsConfig
 
     -- Construct the full 'ResolvedExecutionPlan' from the 'queryParts :: SingleOperation'.

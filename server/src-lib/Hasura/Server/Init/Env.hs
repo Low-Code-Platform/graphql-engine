@@ -27,17 +27,20 @@ import Data.Char qualified as Char
 import Data.HashSet qualified as HashSet
 import Data.String qualified as String
 import Data.Text qualified as Text
+import Data.Text.NonEmpty (mkNonEmptyText)
 import Data.Time qualified as Time
 import Data.URL.Template qualified as Template
 import Database.PG.Query qualified as Query
 import Hasura.Authentication.Role (RoleName, mkRoleName)
 import Hasura.Backends.Postgres.Connection.MonadTx (ExtensionsSchema)
 import Hasura.Backends.Postgres.Connection.MonadTx qualified as MonadTx
+import Hasura.Backends.Postgres.SQL.Types (SchemaName (..))
 import Hasura.Cache.Bounded qualified as Cache
 import Hasura.GraphQL.Execute.Subscription.Options qualified as Subscription.Options
 import Hasura.Logging qualified as Logging
 import Hasura.NativeQuery.Validation qualified as NativeQuery
 import Hasura.Prelude
+import Hasura.RQL.Types.Common qualified as Common
 import Hasura.RQL.Types.Metadata (Metadata, MetadataDefaults (..))
 import Hasura.RQL.Types.NamingCase (NamingCase)
 import Hasura.RQL.Types.NamingCase qualified as NamingCase
@@ -210,6 +213,18 @@ instance FromEnv RoleName where
     case mkRoleName (Text.pack string) of
       Nothing -> Left "empty string not allowed"
       Just roleName -> Right roleName
+
+instance FromEnv Common.SourceName where
+  fromEnv string =
+    let t = Text.pack string
+     in if t == Common.sourceNameToText Common.defaultSource
+          then Right Common.defaultSource
+          else case mkNonEmptyText t of
+            Nothing -> Left "empty source name not allowed"
+            Just net -> Right (Common.SNName net)
+
+instance FromEnv SchemaName where
+  fromEnv = Right . SchemaName . Text.pack
 
 instance FromEnv Bool where
   fromEnv t

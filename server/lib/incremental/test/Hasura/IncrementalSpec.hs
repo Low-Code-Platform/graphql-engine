@@ -11,6 +11,25 @@ import Hasura.Incremental qualified as Inc
 import Hasura.Prelude
 import Test.Hspec
 
+-- | Rule used for keyed InvalidationKey memoisation tests.
+-- Models a "schema block" keyed by schema name whose body re-runs only when
+-- the schema's InvalidationKey changes.  The Writer log records which schema
+-- names actually executed so tests can assert memoisation behaviour.
+schemaRule ::
+  (MonadWriter (S.HashSet String) m, MonadIO m) =>
+  Inc.Rule m (HashMap.HashMap String Inc.InvalidationKey) (HashMap.HashMap String ())
+schemaRule = proc schemas ->
+  (|
+    Inc.keyed
+      ( \schemaName invKey -> do
+          Inc.cache $
+            arrM (\(name, _) -> tell (S.singleton name))
+              -< (schemaName, invKey)
+          returnA -< ()
+      )
+  |)
+    schemas
+
 spec :: Spec
 spec = do
   describe "cache" $ do
@@ -82,3 +101,35 @@ spec = do
       (result2, log2) <- runWriterT . Inc.rebuild result1 $ HashMap.fromList [("a", 1), ("b", 3), ("c", 4)]
       Inc.result result2 `shouldBe` HashMap.fromList [("a", 2), ("b", 6), ("c", 8)]
       log2 `shouldBe` S.fromList [("b", 3), ("c", 4)]
+
+  -- RFC §3 — Incremental Pipeline Tests: Inc.cache behaviour with InvalidationKey
+  --
+  -- These three tests mirror the 'buildTableCacheForSchema' pattern from
+  -- Hasura.RQL.DDL.Schema.Cache: each schema block is wrapped in Inc.cache
+  -- and keyed by schema name.  The InvalidationKey is the per-schema
+  -- invalidation signal drawn from '_ikSourceSchemas'.
+  describe "keyed InvalidationKey memoisation" $ do
+    let key0 = Inc.initialInvalidationKey
+        key1 = Inc.invalidate key0
+        initialSchemas = HashMap.fromList [("schemaA", key0), ("schemaB", key0)]
+
+    it "changing schema A's key does not re-run schema B's block" $ do
+      (result1, _) <- runWriterT $ Inc.build schemaRule initialSchemas
+      (_, log2) <-
+        runWriterT $
+          Inc.rebuild result1 (HashMap.fromList [("schemaA", key1), ("schemaB", key0)])
+      S.member "schemaB" log2 `shouldBe` False
+
+    it "changing schema A's key does re-run schema A's block" $ do
+      (result1, _) <- runWriterT $ Inc.build schemaRule initialSchemas
+      (_, log2) <-
+        runWriterT $
+          Inc.rebuild result1 (HashMap.fromList [("schemaA", key1), ("schemaB", key0)])
+      S.member "schemaA" log2 `shouldBe` True
+
+    it "full-source invalidation re-runs all schema blocks" $ do
+      (result1, _) <- runWriterT $ Inc.build schemaRule initialSchemas
+      (_, log2) <-
+        runWriterT $
+          Inc.rebuild result1 (HashMap.fromList [("schemaA", key1), ("schemaB", key1)])
+      log2 `shouldBe` S.fromList ["schemaA", "schemaB"]

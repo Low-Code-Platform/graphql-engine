@@ -17,6 +17,7 @@ import Data.These (These (..))
 import Hasura.Authentication.User (UserInfo)
 import Hasura.Backends.DataConnector.Agent.Client (AgentLicenseKey)
 import Hasura.Base.Error
+import Hasura.Backends.Postgres.SQL.Types (SchemaName)
 import Hasura.CredentialCache
 import Hasura.EncJSON
 import Hasura.GraphQL.Execute qualified as E
@@ -131,8 +132,10 @@ runCustomEndpoint ::
   RestRequest EndpointMethod ->
   EndpointTrie GQLQueryWithText ->
   Init.ResponseInternalErrorsConfig ->
+  -- | Configured @(default source, default schema)@ from the serve options.
+  (Maybe SourceName, Maybe SchemaName) ->
   m (HttpLogGraphQLInfo, HttpResponse EncJSON)
-runCustomEndpoint env sqlGenCtx sc enableAL readOnlyMode remoteSchemaResponsePriority headerPrecedence traceQueryStatus prometheusMetrics logger agentLicenseKey requestId userInfo reqHeaders ipAddress RestRequest {..} endpoints responseErrorsConfig = do
+runCustomEndpoint env sqlGenCtx sc enableAL readOnlyMode remoteSchemaResponsePriority headerPrecedence traceQueryStatus prometheusMetrics logger agentLicenseKey requestId userInfo reqHeaders ipAddress RestRequest {..} endpoints responseErrorsConfig defaultGqlSchema = do
   -- First match the path to an endpoint.
   case matchPath reqMethod (T.split (== '/') reqPath) endpoints of
     MatchFound (queryx :: EndpointMetadata GQLQueryWithText) matches ->
@@ -162,7 +165,7 @@ runCustomEndpoint env sqlGenCtx sc enableAL readOnlyMode remoteSchemaResponsePri
               -- with the query string from the schema cache, and pass it
               -- through to the /v1/graphql endpoint.
               (httpLoggingMetadata, handlerResp) <- do
-                (gqlOperationLog, resp) <- GH.runGQ env sqlGenCtx sc enableAL readOnlyMode remoteSchemaResponsePriority headerPrecedence traceQueryStatus prometheusMetrics logger agentLicenseKey requestId userInfo ipAddress reqHeaders E.QueryHasura (mkPassthroughRequest queryx resolvedVariables) responseErrorsConfig
+                (gqlOperationLog, resp) <- GH.runGQ env sqlGenCtx sc enableAL readOnlyMode remoteSchemaResponsePriority headerPrecedence traceQueryStatus prometheusMetrics logger agentLicenseKey requestId userInfo ipAddress reqHeaders E.QueryHasura (mkPassthroughRequest queryx resolvedVariables) responseErrorsConfig defaultGqlSchema
                 let httpLoggingGQInfo = (CommonHttpLogMetadata RequestModeNonBatchable Nothing, (PQHSetSingleton (gqolParameterizedQueryHash gqlOperationLog)))
                 return (httpLoggingGQInfo, fst <$> resp)
               case sequence handlerResp of
