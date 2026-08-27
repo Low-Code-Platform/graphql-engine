@@ -325,6 +325,11 @@ serveOptions =
       soEnableMetadataQueryLogging = MetadataQueryLoggingDisabled,
       soHttpLogQueryOnlyOnError = HttpLogQueryOnlyOnErrorDisabled,
       soDefaultNamingConvention = Init._default Init.defaultNamingConventionOption,
+      -- No default (source, schema) pair: header-less introspection falls back
+      -- to the first pair, which is what tests written before these options
+      -- existed assume.
+      soDefaultSource = Nothing,
+      soDefaultSchema = Nothing,
       soExtensionsSchema = ExtensionsSchema "public",
       soMetadataDefaults = emptyMetadataDefaults,
       soApolloFederationStatus = ApolloFederationDisabled,

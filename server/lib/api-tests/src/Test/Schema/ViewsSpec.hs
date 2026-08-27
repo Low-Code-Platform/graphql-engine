@@ -4,9 +4,11 @@ module Test.Schema.ViewsSpec (spec) where
 
 import Data.Aeson (Value)
 import Data.List.NonEmpty qualified as NE
+import Data.Text qualified as T
 import Harness.Backend.Citus qualified as Citus
 import Harness.Backend.Cockroach qualified as Cockroach
 import Harness.Backend.Postgres qualified as Postgres
+import Harness.Backend.Sqlserver qualified as Sqlserver
 import Harness.GraphqlEngine (postGraphql, postMetadata_)
 import Harness.Quoter.Graphql (graphql)
 import Harness.Quoter.Yaml (yaml)
@@ -41,6 +43,13 @@ spec =
                 [ Cockroach.setupTablesAction schema testEnvironment,
                   setupCockroach testEnvironment,
                   setupMetadata Cockroach.backendTypeMetadata testEnvironment
+                ]
+            },
+          (Fixture.fixture $ Fixture.Backend Sqlserver.backendTypeMetadata)
+            { Fixture.setupTeardown = \(testEnvironment, _) ->
+                [ Sqlserver.setupTablesAction schema testEnvironment,
+                  setupSqlserver testEnvironment,
+                  setupMetadata Sqlserver.backendTypeMetadata testEnvironment
                 ]
             }
         ]
@@ -150,6 +159,31 @@ setupCockroach testEnvironment = do
         Cockroach.run_ testEnvironment (createSQL schemaName),
       Fixture.teardownAction = \_ ->
         Cockroach.run_ testEnvironment (dropSQL schemaName)
+    }
+
+--------------------------------------------------------------------------------
+-- SQLServer setup
+
+-- | SQL Server has no @CREATE OR REPLACE VIEW@, and @CREATE VIEW@ must be the
+-- only statement in its batch, so it gets its own SQL rather than sharing
+-- 'createSQL'.
+createSQLSqlserver :: Schema.SchemaName -> Text
+createSQLSqlserver schemaName =
+  let schemaNameString = Schema.unSchemaName schemaName
+   in "CREATE VIEW "
+        <> schemaNameString
+        <> ".author_view AS SELECT id, name FROM "
+        <> schemaNameString
+        <> ".author"
+
+setupSqlserver :: TestEnvironment -> Fixture.SetupAction
+setupSqlserver testEnvironment = do
+  let schemaName = Schema.getSchemaName testEnvironment
+  Fixture.SetupAction
+    { Fixture.setupAction =
+        Sqlserver.run_ testEnvironment (T.unpack (createSQLSqlserver schemaName)),
+      Fixture.teardownAction = \_ ->
+        Sqlserver.run_ testEnvironment (T.unpack (dropSQL schemaName))
     }
 
 --------------------------------------------------------------------------------

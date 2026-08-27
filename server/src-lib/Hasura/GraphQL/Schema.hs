@@ -279,6 +279,11 @@ buildGQLContext
     adminPairResults <-
       case HashMap.lookup adminRoleName perRolePairContexts of
         Just r -> pure r
+        -- With no (source, schema) pairs at all there is nothing to assemble, so
+        -- the admin role having no per-pair results is expected rather than a
+        -- failure. This is the state of every deployment before its first source
+        -- is added -- including the engine the integration-test harness boots.
+        Nothing | HashMap.null perRolePairContexts -> pure mempty
         Nothing -> throw500 "buildGQLContext failed to build for the admin role"
     let adminIntrospection = mergeSchemaIntrospections $ view _3 <$> HashMap.elems adminPairResults
 

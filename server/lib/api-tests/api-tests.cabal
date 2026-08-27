@@ -154,6 +154,7 @@ library
     Test.Databases.SQLServer.ConnectionPoolSpec
     Test.Databases.SQLServer.DefaultValues.OnConflictSpec
     Test.Databases.SQLServer.InsertVarcharColumnSpec
+    Test.Databases.SQLServer.RunSQLDDLSpec
     Test.Databases.SQLServer.VarcharLiteralsSpec
     Test.EventTriggers.EventTriggersSpecialCharactersSpec
     Test.EventTriggers.MSSQL.EventTriggerDropSourceCleanupSpec
