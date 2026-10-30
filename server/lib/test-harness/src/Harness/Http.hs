@@ -8,6 +8,7 @@ module Harness.Http
     post,
     postValue,
     postValueWithStatus,
+    postRawValueWithStatus,
     healthCheck,
     healthCheck',
     HealthCheckResult (..),
@@ -80,6 +81,50 @@ post url headers value = do
   unless ("Content-Type" `elem` (fst <$> Http.getResponseHeaders response))
     $ error ("Missing Content-Type header in response. Response: " <> TL.unpack (pShow response))
   pure response
+
+-- | Post a raw JSON body, byte for byte, to the given URL.
+--
+-- Unlike 'postValue' this takes the body already serialized, because encoding a
+-- 'Value' with aeson re-sorts object keys: a test that cares about the key order
+-- the server receives cannot build its body through aeson at all.
+postRawValueWithStatus :: (HasCallStack) => Int -> String -> Http.RequestHeaders -> L8.ByteString -> IO Value
+postRawValueWithStatus statusCode url headers rawBody = do
+  let request =
+        fromString url
+          & Http.setRequestHeaders (("Content-Type", "application/json") : headers)
+          & Http.setRequestMethod Http.methodPost
+          & Http.setRequestBodyLBS rawBody
+          & Http.setRequestResponseTimeout (Http.Conduit.responseTimeoutMicro 60_000_000)
+  response <- Http.httpLbs request
+  let responseBodyString = L8.unpack $ Http.getResponseBody response
+      responseStatusCode = Http.getResponseStatusCode response
+  if responseStatusCode == statusCode
+    then
+      eitherDecode (Http.getResponseBody response)
+        `onLeft` \err ->
+          reportError
+            [ "In request: " ++ url,
+              "With raw body:",
+              L8.unpack rawBody,
+              "Couldn't decode JSON body:",
+              err,
+              "Body was:",
+              responseBodyString
+            ]
+    else
+      reportError
+        [ "Expecting reponse code ",
+          show statusCode,
+          " but got ",
+          show responseStatusCode,
+          "In request: " ++ url,
+          "With raw body:",
+          L8.unpack rawBody,
+          "Response body:",
+          responseBodyString
+        ]
+  where
+    reportError = error . unlines
 
 -- | Post the JSON to the given URL and expected HTTP response code.
 -- Produces a very descriptive exception or failure.

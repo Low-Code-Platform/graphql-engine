@@ -13,6 +13,9 @@ module Hasura.GraphQL.Transport.HTTP.Protocol
     GQLExecDoc (..),
     OperationName (..),
     VariableValues,
+    withOrderedVariables,
+    withOrderedVariablesInReqs,
+    restoreVariableOrder,
     encodeGQErr,
     encodeGQExecError,
     encodeGQResp,
@@ -30,9 +33,11 @@ import Data.Aeson qualified as J
 import Data.Aeson.Casing qualified as J
 import Data.Aeson.Encoding qualified as J
 import Data.Aeson.KeyMap qualified as KM
+import Data.Aeson.Ordered qualified as JO
 import Data.ByteString.Lazy qualified as BL
 import Data.Either (isLeft)
 import Data.HashMap.Strict qualified as HashMap
+import Data.Vector qualified as V
 import Data.Text.Extended (dquote)
 import Hasura.Base.Error
 import Hasura.Base.Instances ()
@@ -60,7 +65,11 @@ newtype OperationName = OperationName {_unOperationName :: G.Name}
 instance J.FromJSON OperationName where
   parseJSON v = OperationName <$> J.parseJSON v
 
-type VariableValues = HashMap.HashMap G.Name J.Value
+-- | Variable values are insertion-ordered 'JO.Value's rather than aeson
+-- 'J.Value's, so that the key order the client sent survives as far as the
+-- column parsers. See 'withOrderedVariables' for how the order is recovered, and
+-- @rfcs/ordered-json-input.md@ for why it has to be.
+type VariableValues = HashMap.HashMap G.Name JO.Value
 
 -- | https://graphql.org/learn/serving-over-http/#post-request
 --
@@ -118,6 +127,54 @@ type GQLReqUnparsed = GQLReq GQLQueryText
 type GQLReqParsed = GQLReq GQLExecDoc
 
 type ReqsText = GQLBatchedReqs (GQLReq GQLQueryText)
+
+-- | Restore the key order of a request's variable values from an
+-- order-preserving parse of the same request body.
+--
+-- Request bodies are decoded by the ordinary aeson instances, which is where the
+-- order is lost: 'Hasura.Server.App.parseBody' turns the body into a 'J.Value',
+-- and aeson's @KeyMap@ has sorted every object by the time any 'J.FromJSON'
+-- instance sees it. Writing a second, order-preserving decoder for the whole
+-- request would mean a second set of validation and error messages to keep in
+-- step with this one, so instead we decode exactly as before and then replace
+-- each variable's /value/ with the ordered one parsed from the same bytes.
+--
+-- The key set is therefore whatever the aeson decode produced — this cannot add,
+-- drop, or rename a variable, and a variable missing from the ordered parse
+-- keeps the value it already had.
+withOrderedVariables :: JO.Value -> GQLReq a -> GQLReq a
+withOrderedVariables bodyVal req =
+  req {_grVariables = restoreVariableOrder bodyVal <$> _grVariables req}
+
+-- | The primitive behind 'withOrderedVariables': given the ordered parse of a
+-- request body, replace each value in an already-decoded variables map with the
+-- ordered one of the same name.
+restoreVariableOrder :: JO.Value -> VariableValues -> VariableValues
+restoreVariableOrder bodyVal = HashMap.mapWithKey restore
+  where
+    orderedVars = case bodyVal of
+      JO.Object obj -> case JO.lookup "variables" obj of
+        Just (JO.Object vars) -> Just vars
+        _ -> Nothing
+      _ -> Nothing
+    restore name sortedVal =
+      fromMaybe sortedVal $ orderedVars >>= JO.lookup (G.unName name)
+
+-- | 'withOrderedVariables' over a possibly-batched request.
+--
+-- The batched case pairs requests with body elements positionally, which is
+-- sound because the list was itself decoded elementwise from that same array
+-- (see the 'J.FromJSON' instance for 'GQLBatchedReqs'). The length check only
+-- guards against a future divergence; on a mismatch the aeson-decoded values are
+-- kept rather than risking attaching one request's variables to another.
+withOrderedVariablesInReqs :: JO.Value -> GQLBatchedReqs (GQLReq a) -> GQLBatchedReqs (GQLReq a)
+withOrderedVariablesInReqs bodyVal = \case
+  GQLSingleRequest req -> GQLSingleRequest $ withOrderedVariables bodyVal req
+  GQLBatchedReqs reqs -> GQLBatchedReqs $ case bodyVal of
+    JO.Array elems
+      | V.length elems == length reqs ->
+          zipWith withOrderedVariables (V.toList elems) reqs
+    _ -> reqs
 
 -- | A simplified form of 'GQLReqParsed' which is more ergonomic in particular
 -- for APIs that act as graphql /clients/ (e.g. in remote relationship

@@ -38,6 +38,7 @@ import Data.Aeson qualified as J
 import Data.Aeson.Encoding qualified as J
 import Data.Aeson.Key qualified as K
 import Data.Aeson.KeyMap qualified as KM
+import Data.Aeson.Ordered qualified as JO
 import Data.Aeson.Types qualified as J
 import Data.ByteString.Builder qualified as BB
 import Data.ByteString.Char8 qualified as B8
@@ -248,6 +249,34 @@ parseBody reqBody =
     Left e -> throw400 InvalidJSON (T.pack e)
     Right jVal -> (jVal,) <$> decodeValue jVal
 
+-- | As 'parseBody', but restores the key order of GraphQL variable values when
+-- 'EFOrderedJsonInput' is enabled.
+--
+-- Decoding itself is untouched: the body goes through 'parseBody' exactly as
+-- before, so accepted requests, rejected requests, and error messages are all
+-- unchanged. Only when the feature is on do we additionally parse the body with
+-- an order-preserving decoder and swap the ordered values into the
+-- already-decoded variables map, so a deployment that has not opted in does not
+-- pay for the second parse.
+--
+-- A failure of that second parse is deliberately ignored rather than propagated:
+-- 'parseBody' has already accepted these bytes as valid JSON, and a disagreement
+-- between the two parsers must not turn a working request into a rejected one.
+parseBodyWithOrderedVariables ::
+  (FromJSON a, MonadError QErr m) =>
+  S.HashSet ExperimentalFeature ->
+  (JO.Value -> a -> a) ->
+  BL.ByteString ->
+  m (Value, a)
+parseBodyWithOrderedVariables expFeatures restoreOrder reqBody = do
+  (jVal, parsed) <- parseBody reqBody
+  pure
+    ( jVal,
+      if EFOrderedJsonInput `S.member` expFeatures
+        then either (const parsed) (`restoreOrder` parsed) (JO.eitherDecode reqBody)
+        else parsed
+    )
+
 onlyAdmin :: (MonadError QErr m, MonadReader HandlerCtx m) => m ()
 onlyAdmin = do
   uRole <- asks (_uiRole . hcUser)
@@ -381,7 +410,7 @@ mkSpockAction appStateRef qErrEncoder qErrModifier apiHandler = do
       -- in this case we parse the request _first_ and then send the request to the webhook for auth
       AHGraphQLRequest handler -> do
         (queryJSON, parsedReq) <-
-          runExcept (parseBody reqBody) `onLeft` \e -> do
+          runExcept (parseBodyWithOrderedVariables acExperimentalFeatures GH.withOrderedVariablesInReqs reqBody) `onLeft` \e -> do
             -- if the request fails to parse, call the webhook without a request body
             -- TODO should we signal this to the webhook somehow?
             (userInfo, _, _, _, extraUserInfo) <- getInfo Nothing
@@ -392,7 +421,7 @@ mkSpockAction appStateRef qErrEncoder qErrModifier apiHandler = do
         pure (res, userInfo, authHeaders, includeInternal, Just queryJSON, extraUserInfo)
       AHPersistedGraphQLRequest handler -> do
         (queryJSON, parsedReq) <-
-          runExcept (parseBody reqBody) `onLeft` \e -> do
+          runExcept (parseBodyWithOrderedVariables acExperimentalFeatures withOrderedVariablesInExtReqs reqBody) `onLeft` \e -> do
             -- if the request fails to parse, call the webhook without a request body
             -- TODO should we signal this to the webhook somehow?
             (userInfo, _, _, _, extraUserInfo) <- getInfo Nothing
@@ -1007,8 +1036,12 @@ httpApp setupHook appStateRef AppEnv {..} consoleType ekgStore closeWebsocketsOn
     -- This is where we decode the json encoded body args. They
     -- are treated as if they came from query arguments, but allow
     -- us to pass non-scalar values.
-    let bodyParams = case J.decodeStrict body of
-          Just (J.Object o) -> map (first K.toText) $ KM.toList o
+    -- Decoded with the order-preserving parser rather than aeson so that a
+    -- JSON object passed to a REST endpoint keeps its key order; see
+    -- 'EFOrderedJsonInput'. This replaces the aeson parse rather than adding
+    -- one, so it costs nothing when the feature is off.
+    let bodyParams = case JO.decode body of
+          Just (JO.Object o) -> JO.toList o
           _ -> []
         allParams = fmap Left <$> queryParams <|> fmap Right <$> bodyParams
 

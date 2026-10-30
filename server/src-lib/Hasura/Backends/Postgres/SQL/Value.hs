@@ -95,6 +95,14 @@ data PGScalarValue
   | PGValTimeTZ ZonedTimeOfDay
   | PGNull PGScalarType
   | PGValJSON PG.JSON
+  | -- | Pre-serialized JSON text bound for a @json@ column, used instead of
+    -- 'PGValJSON' when 'Hasura.Server.Types.EFOrderedJsonInput' is on. Carrying
+    -- the bytes rather than an aeson 'Value' is the whole point: aeson's
+    -- @KeyMap@ would re-sort the object keys on the way back out.
+    --
+    -- Only ever constructed for @json@, never @jsonb@ — see
+    -- 'Hasura.RQL.Types.Schema.Options.OrderedJsonInput'.
+    PGValJSONRaw Text
   | PGValJSONB PG.JSONB
   | PGValGeo GeometryWithCRS
   | PGValRaster RasterWKB
@@ -127,6 +135,10 @@ pgScalarValueToJson = \case
     toJSON (show tod ++ timeZoneOffsetString tz)
   PGNull _ -> Null
   PGValJSON (PG.JSON j) -> j
+  -- Round-tripping through aeson re-sorts the keys, but this function exists to
+  -- describe a value to the rest of the engine, not to produce the bytes that
+  -- reach Postgres (that is 'txtEncodedVal' / 'binEncoder').
+  PGValJSONRaw t -> fromMaybe (String t) $ decode $ txtToLbs t
   PGValJSONB (PG.JSONB j) -> j
   PGValGeo o -> toJSON o
   PGValRaster r -> toJSON r
@@ -258,6 +270,9 @@ txtEncodedVal = \case
     TELit
       $ TL.toStrict
       $ AE.encodeToLazyText j
+  -- Already serialized, in the client's key order. Emitting it verbatim is the
+  -- entire purpose of this constructor.
+  PGValJSONRaw t -> TELit t
   PGValJSONB (PG.JSONB j) ->
     TELit
       $ TL.toStrict
@@ -294,6 +309,10 @@ binEncoder = \case
   PGValTimeTZ (ZonedTimeOfDay t z) -> PG.toPrepValHelper PTI.timetz PE.timetz_int (t, z)
   PGNull ty -> (pgTypeOid ty, Nothing)
   PGValJSON u -> PG.toPrepVal u
+  -- Hand Postgres the bytes as text and let it parse them as @json@, which
+  -- stores the document verbatim. Same shape as 'PGValUnknown' below, but with
+  -- the @json@ OID so there is no ambiguity about the target type.
+  PGValJSONRaw t -> (PTI.json, Just (TE.encodeUtf8 t, PQ.Text))
   PGValJSONB u -> PG.toPrepVal u
   PGValGeo o -> PG.toPrepVal $ TL.toStrict $ AE.encodeToLazyText o
   PGValRaster r -> PG.toPrepVal $ TC.toText $ getRasterWKB r
@@ -342,6 +361,10 @@ buildArrayLiteral ts =
           Just jv -> fromJson jv -- it was some actual JSON in disguise! encode it like usual
           Nothing -> TELit $ escape (escape s) -- it's an actual JSON string, so add quotes again
         _ -> fromJson j
+      -- Already serialized; it only needs quoting as an array element, which is
+      -- exactly what 'fromJson' does after encoding. No "JSON in disguise"
+      -- check applies: these bytes came from a JSON document, not a scalar.
+      PGValJSONRaw t -> TELit $ escape t
       PGValJSONB (PG.JSONB j) -> case j of
         -- we do the same for JSONB as JSON
         String s -> case decode (txtToLbs s) of

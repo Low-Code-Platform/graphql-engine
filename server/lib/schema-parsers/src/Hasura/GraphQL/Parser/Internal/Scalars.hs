@@ -30,6 +30,7 @@ where
 
 import Control.Monad ((>=>))
 import Data.Aeson qualified as J
+import Data.Aeson.Ordered qualified as JO
 import Data.Aeson.Types qualified as J.Internal
 import Data.Int (Int32, Int64)
 import Data.Scientific (Scientific)
@@ -63,7 +64,7 @@ import Language.GraphQL.Draft.Syntax hiding (Definition)
 namedBoolean :: (MonadParse m) => Name -> Parser origin 'Both m Bool
 namedBoolean name = mkScalar name \case
   GraphQLValue (VBoolean b) -> pure b
-  JSONValue (J.Bool b) -> pure b
+  JSONValue (JO.Bool b) -> pure b
   v -> typeMismatch name "a boolean" v
 
 boolean :: (MonadParse m) => Parser origin 'Both m Bool
@@ -72,7 +73,7 @@ boolean = namedBoolean GName._Boolean
 namedInt :: (MonadParse m) => Name -> Parser origin 'Both m Int32
 namedInt name = mkScalar name \case
   GraphQLValue (VInt i) -> scientificToInteger $ fromInteger i
-  JSONValue (J.Number n) -> scientificToInteger n
+  JSONValue (JO.Number n) -> scientificToInteger n
   v -> typeMismatch name "a 32-bit integer" v
 
 int :: (MonadParse m) => Parser origin 'Both m Int32
@@ -82,7 +83,7 @@ namedFloat :: (MonadParse m) => Name -> Parser origin 'Both m Double
 namedFloat name = mkScalar name \case
   GraphQLValue (VFloat f) -> scientificToFloat f
   GraphQLValue (VInt i) -> scientificToFloat $ fromInteger i
-  JSONValue (J.Number n) -> scientificToFloat n
+  JSONValue (JO.Number n) -> scientificToFloat n
   v -> typeMismatch name "a float" v
 
 float :: (MonadParse m) => Parser origin 'Both m Double
@@ -91,7 +92,7 @@ float = namedFloat GName._Float
 namedString :: (MonadParse m) => Name -> Parser origin 'Both m Text
 namedString name = mkScalar name \case
   GraphQLValue (VString s) -> pure s
-  JSONValue (J.String s) -> pure s
+  JSONValue (JO.String s) -> pure s
   v -> typeMismatch name "a string" v
 
 string :: (MonadParse m) => Parser origin 'Both m Text
@@ -103,8 +104,8 @@ namedIdentifier :: (MonadParse m) => Name -> Parser origin 'Both m Text
 namedIdentifier name = mkScalar name \case
   GraphQLValue (VString s) -> pure s
   GraphQLValue (VInt i) -> pure . Text.pack $ show i
-  JSONValue (J.String s) -> pure s
-  JSONValue (J.Number n) -> parseScientific n
+  JSONValue (JO.String s) -> pure s
+  JSONValue (JO.Number n) -> parseScientific n
   v -> typeMismatch name "a String or a 32-bit integer" v
   where
     parseScientific = fmap (Text.pack . show @Int) . scientificToInteger
@@ -118,7 +119,7 @@ identifier = namedIdentifier GName._ID
 uuid :: (MonadParse m) => Parser origin 'Both m UUID.UUID
 uuid = mkScalar name \case
   GraphQLValue (VString s) -> parseJSON $ J.String s
-  JSONValue v -> parseJSON v
+  JSONValue v -> parseJSON $ JO.fromOrdered v
   v -> typeMismatch name "a UUID" v
   where
     name = $$(litName "uuid")
@@ -133,7 +134,7 @@ jsonb = jsonScalar $$(litName "jsonb") Nothing
 nonNegativeInt :: (MonadParse m) => Parser origin 'Both m Int32
 nonNegativeInt = mkScalar GName._Int \case
   GraphQLValue (VInt i) | i >= 0 -> scientificToInteger $ fromInteger i
-  JSONValue (J.Number n) | n >= 0 -> scientificToInteger n
+  JSONValue (JO.Number n) | n >= 0 -> scientificToInteger n
   v -> typeMismatch GName._Int "a non-negative 32-bit integer" v
 
 -- | GraphQL ints are 32-bit integers; but in some places we want to accept bigger ints. To do so,
@@ -143,11 +144,11 @@ nonNegativeInt = mkScalar GName._Int \case
 bigInt :: (MonadParse m) => Parser origin 'Both m Int64
 bigInt = mkScalar GName._Int \case
   GraphQLValue (VInt i) -> scientificToInteger $ fromInteger i
-  JSONValue (J.Number n) -> scientificToInteger n
+  JSONValue (JO.Number n) -> scientificToInteger n
   GraphQLValue (VString s)
     | Right (i, "") <- decimal s ->
         pure i
-  JSONValue (J.String s)
+  JSONValue (JO.String s)
     | Right (i, "") <- decimal s ->
         pure i
   v -> typeMismatch GName._Int "a 32-bit integer, or a 64-bit integer represented as a string" v
@@ -158,7 +159,7 @@ scientific :: (MonadParse m) => Parser origin 'Both m Scientific
 scientific = mkScalar name \case
   GraphQLValue (VFloat f) -> pure f
   GraphQLValue (VInt i) -> pure $ S.scientific i 0
-  JSONValue (J.Number n) -> pure n
+  JSONValue (JO.Number n) -> pure n
   v -> typeMismatch name "Decimal represented as a string" v
   where
     name = $$(litName "decimal")

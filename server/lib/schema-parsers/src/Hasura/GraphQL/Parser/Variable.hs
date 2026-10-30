@@ -5,7 +5,7 @@ module Hasura.GraphQL.Parser.Variable
   )
 where
 
-import Data.Aeson qualified as J
+import Data.Aeson.Ordered qualified as JO
 import Data.Hashable (Hashable)
 import Data.Void (Void)
 import GHC.Generics (Generic)
@@ -72,9 +72,17 @@ each input parser constructor needs to be able to parse both GraphQL values and
 JSON values, but fortunately, the duplication of logic is minimal. -}
 
 -- | See Note [Parsing variable values].
+--
+-- The JSON payload is an /insertion-ordered/ 'JO.Value' rather than an aeson
+-- 'Data.Aeson.Value', so that the key order the client sent survives as far as
+-- the column parsers. Only Postgres @json@ columns actually consume that order
+-- (see @valueToOrderedJSON@); every other consumer calls 'JO.fromOrdered' and
+-- behaves exactly as before. 'JO.Value''s 'Eq' and 'Hashable' are
+-- order-insensitive, so using it here does not perturb query-plan cache keys or
+-- subscription cohort identity.
 data InputValue v
   = GraphQLValue (Value v)
-  | JSONValue J.Value
+  | JSONValue JO.Value
   deriving (Show, Eq, Functor, Generic, Ord, TH.Lift)
 
 instance (Hashable v) => Hashable (InputValue v)

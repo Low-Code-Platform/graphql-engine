@@ -32,6 +32,7 @@ module Harness.GraphqlEngine
     postGraphqlWithPair,
     postGraphqlWithHeaders,
     postWithHeadersStatus,
+    postGraphqlRaw,
     clearMetadata,
     postV1Query,
     postV2Query,
@@ -156,6 +157,23 @@ postWithHeadersStatus statusCode testEnv@(getServer -> Server {urlPrefix, port})
     testLogMessage testEnv $ LogHGERequest (T.pack path) $ traceIf testEnv requestBody
     responseBody <- Http.postValueWithStatus statusCode (urlPrefix ++ ":" ++ show port ++ path) (addAuthzHeaders testEnv headers) requestBody
     testLogMessage testEnv $ LogHGEResponse (T.pack path) responseBody
+    pure responseBody
+
+-- | Post a raw, already-serialized request body to @\/v1\/graphql@.
+--
+-- For tests that care about the JSON key order the server receives: building a
+-- body with aeson would sort the keys before it ever left the client.
+postGraphqlRaw :: (HasCallStack) => TestEnvironment -> Char8.ByteString -> IO Value
+postGraphqlRaw testEnv@(getServer -> Server {urlPrefix, port}) rawBody =
+  withFrozenCallStack $ do
+    testLogMessage testEnv $ LogHGERequest "/v1/graphql" $ String $ T.pack $ Char8.unpack rawBody
+    responseBody <-
+      Http.postRawValueWithStatus
+        200
+        (urlPrefix ++ ":" ++ show port ++ "/v1/graphql")
+        (addAuthzHeaders testEnv mempty)
+        rawBody
+    testLogMessage testEnv $ LogHGEResponse "/v1/graphql" responseBody
     pure responseBody
 
 addAuthzHeaders :: TestEnvironment -> Http.RequestHeaders -> Http.RequestHeaders

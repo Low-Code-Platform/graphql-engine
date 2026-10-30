@@ -17,6 +17,7 @@ module Hasura.RQL.Types.Schema.Options
     UsePostgresArrays (..),
     NoNullUnboundVariableDefault (..),
     RemoveEmptySubscriptionResponses (..),
+    OrderedJsonInput (..),
   )
 where
 
@@ -38,7 +39,8 @@ data SchemaOptions = SchemaOptions
     soIncludeGroupByAggregateFields :: IncludeGroupByAggregateFields,
     soPostgresArrays :: UsePostgresArrays,
     soNoNullUnboundVariableDefault :: NoNullUnboundVariableDefault,
-    soRemoveEmptySubscriptionResponses :: RemoveEmptySubscriptionResponses
+    soRemoveEmptySubscriptionResponses :: RemoveEmptySubscriptionResponses,
+    soOrderedJsonInput :: OrderedJsonInput
   }
 
 -- | Should we represent numbers in our responses as numbers, or strings?
@@ -199,6 +201,16 @@ data IncludeGroupByAggregateFields
 data UsePostgresArrays
   = UsePostgresArrays
   | DontUsePostgresArrays
+  deriving (Eq, Show)
+
+-- | Should a write to a Postgres @json@ column keep the key order the client
+-- sent, or store the keys alphabetically sorted as the engine always has?
+--
+-- Affects @json@ only; @jsonb@ re-sorts on storage regardless. See
+-- 'Hasura.Server.Types.EFOrderedJsonInput'.
+data OrderedJsonInput
+  = PreserveJsonInputOrder
+  | SortJsonInputKeys
   deriving (Eq, Show)
 
 -- | The spec says that unbound nullable variables with no defaults should be

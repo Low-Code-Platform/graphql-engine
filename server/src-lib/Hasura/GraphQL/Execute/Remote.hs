@@ -10,6 +10,7 @@ module Hasura.GraphQL.Execute.Remote
 where
 
 import Data.Aeson qualified as J
+import Data.Aeson.Ordered qualified as JO
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet qualified as Set
 import Data.Text qualified as T
@@ -29,7 +30,7 @@ import Hasura.RQL.Types.ResultCustomization
 import Hasura.RemoteSchema.SchemaCache
 import Language.GraphQL.Draft.Syntax qualified as G
 
-getVariableDefinitionAndValue :: Variable -> (G.VariableDefinition, (G.Name, J.Value))
+getVariableDefinitionAndValue :: Variable -> (G.VariableDefinition, (G.Name, JO.Value))
 getVariableDefinitionAndValue var@(Variable varInfo gType varValue) =
   (varDefn, (varName, varJSONValue))
   where
@@ -45,9 +46,12 @@ getVariableDefinitionAndValue var@(Variable varInfo gType varValue) =
     varJSONValue =
       case varValue of
         Just (JSONValue v) -> v
-        Just (GraphQLValue val) -> graphQLValueToJSON val
+        -- An inline literal's key order was already lost in the GraphQL AST, so
+        -- there is nothing to preserve here; 'JO.toOrdered' reproduces the
+        -- alphabetical order aeson would have given it.
+        Just (GraphQLValue val) -> JO.toOrdered $ graphQLValueToJSON val
         -- TODO: is this semantically correct RE: GraphQL spec June 2018, section 2.9.5?
-        Nothing -> J.Null
+        Nothing -> JO.Null
 
 unresolveVariables ::
   forall fragments.
@@ -219,7 +223,7 @@ resolveRemoteVariable userInfo = \case
     varName <-
       G.mkName varText
         `onNothing` throw500 ("'" <> varText <> "' is not a valid GraphQL name")
-    pure $ Variable (VIRequired varName) gtype $ Just $ JSONValue jsonValue
+    pure $ Variable (VIRequired varName) gtype $ Just $ JSONValue $ JO.toOrdered jsonValue
   QueryVariable variable -> pure variable
 
 -- | TODO: Documentation.

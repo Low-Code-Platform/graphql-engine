@@ -30,6 +30,7 @@ module Hasura.Server.Types
     PersistedQueryRequest (..),
     ExtPersistedQueryRequest (..),
     ExtQueryReqs (..),
+    withOrderedVariablesInExtReqs,
     MonadGetPolicies (..),
     RemoteSchemaResponsePriority (..),
     HeaderPrecedence (..),
@@ -41,6 +42,7 @@ import Control.Lens qualified as Lens
 import Data.Aeson
 import Data.Aeson.Casing qualified as J
 import Data.Aeson.Lens
+import Data.Aeson.Ordered qualified as JO
 import Data.Aeson.TH qualified as J
 import Data.Text (intercalate, unpack)
 import Database.PG.Query qualified as PG
@@ -133,6 +135,19 @@ data ExperimentalFeature
     --
     -- See @rfcs/phase9-per-table-field-cache.md@.
     EFDisablePerTableSchemaCache
+  | -- | Preserve the client's JSON object key order when writing to a Postgres
+    -- @json@ column, instead of storing the keys alphabetically sorted.
+    --
+    -- Only @json@ columns are affected. @jsonb@ decomposes into a binary form
+    -- that re-sorts keys (by length, then bytewise) and drops duplicates, so
+    -- nothing upstream of a @jsonb@ column can preserve order.
+    --
+    -- The order is faithful for values supplied as GraphQL /variables/. Inline
+    -- object literals are unaffected: they lose their order earlier, in the
+    -- GraphQL parser's AST, and continue to be stored alphabetically.
+    --
+    -- See @rfcs/ordered-json-input.md@.
+    EFOrderedJsonInput
   deriving (Bounded, Enum, Eq, Generic, Show)
 
 experimentalFeatureKey :: ExperimentalFeature -> Text
@@ -152,6 +167,7 @@ experimentalFeatureKey = \case
   EFRemoveEmptySubscriptionResponses -> "remove_empty_subscription_responses"
   EFEnableRelaySchema -> "enable_relay_schema"
   EFDisablePerTableSchemaCache -> "disable_per_table_schema_cache"
+  EFOrderedJsonInput -> "ordered_json_input"
 
 instance Hashable ExperimentalFeature
 
@@ -365,6 +381,17 @@ instance FromJSON ExtQueryReqs where
     -- The APQ requests, have a special object in the key `Extentions` called as `persistedQuery`
     | isJust (json Lens.^? key "extensions" . key "persistedQuery") = EqrAPQReq <$> parseJSON json
     | otherwise = EqrGQLReq <$> (GH.GQLSingleRequest <$> parseJSON json)
+
+-- | Restore variable-value key order in a POST body that may be either a normal
+-- GraphQL request or a persisted-query request. See
+-- 'GH.withOrderedVariables'.
+withOrderedVariablesInExtReqs :: JO.Value -> ExtQueryReqs -> ExtQueryReqs
+withOrderedVariablesInExtReqs bodyVal = \case
+  EqrGQLReq reqs -> EqrGQLReq $ GH.withOrderedVariablesInReqs bodyVal reqs
+  -- A persisted query carries its variables at the top level of the body rather
+  -- than inside a 'GH.GQLReq', but they come from the same place.
+  EqrAPQReq apq ->
+    EqrAPQReq apq {_extVariables = GH.restoreVariableOrder bodyVal <$> _extVariables apq}
 
 class (Monad m) => MonadGetPolicies m where
   runGetApiTimeLimit ::

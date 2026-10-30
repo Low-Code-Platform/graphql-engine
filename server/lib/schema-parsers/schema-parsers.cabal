@@ -116,6 +116,7 @@ library
       TypeOperators
   build-depends:
       aeson
+    , aeson-ordered
     , base
     , dependent-map
     , dependent-sum

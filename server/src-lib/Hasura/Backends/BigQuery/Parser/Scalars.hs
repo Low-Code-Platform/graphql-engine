@@ -19,6 +19,7 @@ module Hasura.Backends.BigQuery.Parser.Scalars
 where
 
 import Data.Aeson qualified as J
+import Data.Aeson.Ordered qualified as JO
 import Data.Int (Int64)
 import Data.Scientific (Scientific)
 import Data.Scientific qualified as S
@@ -45,8 +46,8 @@ bqInt64 = mkScalar name "64-bit integers. Accepts both string and number literal
     | checkIntegerBounds i -> return $ BigQuery.Int64 (tshow i)
     | otherwise -> boundsFailure (tshow i)
   GraphQLValue (VString s) -> integralText s
-  JSONValue (J.String s) -> integralText s
-  JSONValue (J.Number n) -> integralSci (tshow n) n
+  JSONValue (JO.String s) -> integralText s
+  JSONValue (JO.Number n) -> integralSci (tshow n) n
   v -> typeMismatch name "a 64-bit integer" v
   where
     name = [G.name|bigquery_int|]
@@ -76,8 +77,8 @@ bqFloat64 = mkScalar name "64-bit floats. Accepts both string and number literal
   GraphQLValue (VFloat f) -> floatSci (tshow f) f
   GraphQLValue (VInt i) -> floatSci (tshow i) (fromInteger i)
   GraphQLValue (VString s) -> floatText s
-  JSONValue (J.String s) -> floatText s
-  JSONValue (J.Number n) -> floatSci (tshow n) n
+  JSONValue (JO.String s) -> floatText s
+  JSONValue (JO.Number n) -> floatSci (tshow n) n
   v -> typeMismatch name "a 64-bit float" v
   where
     name = [G.name|bigquery_float|]
@@ -113,8 +114,8 @@ decimal name = \case
   GraphQLValue (VString s)
     | Just sci <- readMaybe (Text.unpack s) -> pure $ sci
     | otherwise -> stringNotationError name s
-  JSONValue (J.Number n) -> pure n
-  JSONValue (J.String s)
+  JSONValue (JO.Number n) -> pure n
+  JSONValue (JO.String s)
     | Just sci <- readMaybe (Text.unpack s) -> pure $ sci
     | otherwise -> stringNotationError name s
   v -> typeMismatch name "decimal" v

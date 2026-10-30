@@ -464,7 +464,11 @@ buildSchemaOptions
         soNoNullUnboundVariableDefault =
           noNullUnboundVariableDefault,
         soRemoveEmptySubscriptionResponses =
-          removeEmptySubscriptionResponses
+          removeEmptySubscriptionResponses,
+        soOrderedJsonInput =
+          if EFOrderedJsonInput `Set.member` expFeatures
+            then Options.PreserveJsonInputOrder
+            else Options.SortJsonInputKeys
       }
 
 -- | Assemble the per-role GQL context from pre-computed source parsers plus

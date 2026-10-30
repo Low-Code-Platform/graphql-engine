@@ -4,6 +4,7 @@ module Hasura.GraphQL.Logging.QueryLogSpec
 where
 
 import Data.Aeson qualified as J
+import Data.Aeson.Ordered qualified as JO
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet qualified as HashSet
 import Hasura.GraphQL.Logging.QueryLog
@@ -22,8 +23,10 @@ spec = Hspec.describe "QueryLog Masking" $ do
 mkName :: Text -> G.Name
 mkName t = fromMaybe (error "invalid name") (G.mkName t)
 
+-- | Variable values are insertion-ordered now; the cases here are all flat
+-- scalars, so converting from aeson loses nothing.
 mkVariableValues :: [(Text, J.Value)] -> Protocol.VariableValues
-mkVariableValues = HashMap.fromList . map (first mkName)
+mkVariableValues = HashMap.fromList . map (\(name, val) -> (mkName name, JO.toOrdered val))
 
 mkTestQueryLog :: Protocol.VariableValues -> Maybe GeneratedQuery -> QueryLog
 mkTestQueryLog vars mGenSql =
@@ -69,9 +72,9 @@ maskQueryLogSpec =
       case Protocol._grVariables (_qlQuery result) of
         Nothing -> Hspec.expectationFailure "Expected generated SQL to be present"
         Just resultVars -> do
-          HashMap.lookup (mkName "password") resultVars `Hspec.shouldBe` Just (J.String "[MASKED]")
-          HashMap.lookup (mkName "email") resultVars `Hspec.shouldBe` Just (J.String "[MASKED]")
-          HashMap.lookup (mkName "name") resultVars `Hspec.shouldBe` Just (J.String "Alice")
+          HashMap.lookup (mkName "password") resultVars `Hspec.shouldBe` Just (JO.String "[MASKED]")
+          HashMap.lookup (mkName "email") resultVars `Hspec.shouldBe` Just (JO.String "[MASKED]")
+          HashMap.lookup (mkName "name") resultVars `Hspec.shouldBe` Just (JO.String "Alice")
 
     Hspec.it "masks prepared_arguments in generated SQL" $ do
       let vars = mkVariableValues [("name", J.String "Alice")]

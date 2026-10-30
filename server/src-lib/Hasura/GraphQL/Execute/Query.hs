@@ -53,7 +53,7 @@ parseGraphQLQuery ::
   Options.NoNullUnboundVariableDefault ->
   GQLContext ->
   [G.VariableDefinition] ->
-  Maybe (HashMap G.Name J.Value) ->
+  Maybe GH.VariableValues ->
   [G.Directive G.Name] ->
   G.SelectionSet G.NoFragments G.Name ->
   m

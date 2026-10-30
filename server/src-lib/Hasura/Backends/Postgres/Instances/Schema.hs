@@ -14,6 +14,7 @@ where
 
 import Data.Aeson qualified as J
 import Data.Aeson.Key qualified as K
+import Data.Aeson.Ordered qualified as JO
 import Data.Aeson.Types (JSONPathElement (..))
 import Data.Has
 import Data.HashMap.Strict.Extended qualified as HashMap
@@ -64,6 +65,7 @@ import Hasura.GraphQL.Schema.Parser qualified as P
 import Hasura.GraphQL.Schema.Select
 import Hasura.GraphQL.Schema.Update qualified as SU
 import Hasura.GraphQL.Schema.Update.Batch qualified as SUB
+import Hasura.EncJSON (encJFromOrderedValue, encJToBS)
 import Hasura.LogicalModel.Schema (defaultLogicalModelArgs, defaultLogicalModelSelectionSet)
 import Hasura.Name qualified as Name
 import Hasura.NativeQuery.Schema qualified as NativeQueries
@@ -468,18 +470,33 @@ columnParser columnType nullability = case columnType of
       _ -> do
         name <- mkScalarTypeName tCase scalarType
         pure (name, P.TNamed P.NonNullable $ P.Definition name Nothing Nothing [] P.TIScalar)
+    orderedJsonInput <- retrieve Options.soOrderedJsonInput
     pure
       $ peelWithOrigin
       $ fmap (ColumnValue columnType)
       $ possiblyNullable scalarType nullability
       $ P.Parser
         { pType = schemaType,
-          pParser =
-            P.valueToJSON (P.toGraphQLType schemaType) >=> \case
-              J.Null -> P.parseError $ "unexpected null value for type " <> toErrorValue name
-              value ->
-                runAesonParser (parsePGValue scalarType) value
-                  `onLeft` (P.parseErrorWith P.ParseFailed . toErrorMessage . qeError)
+          pParser = case (scalarType, orderedJsonInput) of
+            -- A @json@ column stores its input document verbatim, so it is the
+            -- one scalar type for which the client's key order is observable
+            -- afterwards. Keep the ordered value and serialize it ourselves
+            -- rather than letting it round-trip through an aeson 'Value', whose
+            -- @KeyMap@ would sort the keys.
+            --
+            -- @jsonb@ is deliberately excluded: it decomposes into a binary form
+            -- that re-sorts keys regardless of what we send, so taking this path
+            -- for it would add cost and change nothing.
+            (PGJSON, Options.PreserveJsonInputOrder) ->
+              P.valueToOrderedJSON (P.toGraphQLType schemaType) >=> \case
+                JO.Null -> P.parseError $ "unexpected null value for type " <> toErrorValue name
+                value -> pure $ PGValJSONRaw $ encodeOrderedJsonText value
+            _ ->
+              P.valueToJSON (P.toGraphQLType schemaType) >=> \case
+                J.Null -> P.parseError $ "unexpected null value for type " <> toErrorValue name
+                value ->
+                  runAesonParser (parsePGValue scalarType) value
+                    `onLeft` (P.parseErrorWith P.ParseFailed . toErrorMessage . qeError)
         }
   ColumnEnumReference (EnumReference tableName enumValues tableCustomName) ->
     case nonEmpty . sortOn fst $ HashMap.toList enumValues of
@@ -488,6 +505,14 @@ columnParser columnType nullability = case columnType of
           . fmap (ColumnValue columnType)
           <$> enumParser @pgKind tableName enumValuesList tableCustomName nullability
       Nothing -> throw400 ValidationFailed "empty enum values"
+
+-- | Serialize an ordered JSON value to text with its key order intact.
+--
+-- Deliberately not @J.encode . JO.fromOrdered@: converting to an aeson 'J.Value'
+-- first would put the keys back through a @KeyMap@ and sort them, undoing the
+-- only thing this path exists to achieve.
+encodeOrderedJsonText :: JO.Value -> Text
+encodeOrderedJsonText = bsToTxt . encJToBS . encJFromOrderedValue
 
 enumParser ::
   forall pgKind r m n.
