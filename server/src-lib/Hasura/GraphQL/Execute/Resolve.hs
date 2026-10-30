@@ -5,7 +5,6 @@ module Hasura.GraphQL.Execute.Resolve
   )
 where
 
-import Data.Aeson qualified as J
 import Data.Aeson.Ordered qualified as JO
 import Data.HashMap.Strict.Extended qualified as HashMap
 import Data.HashSet qualified as HS

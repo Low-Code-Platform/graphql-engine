@@ -4,7 +4,6 @@ module Hasura.GraphQL.Execute.Query
   )
 where
 
-import Data.Aeson qualified as J
 import Data.Environment qualified as Env
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashMap.Strict.InsOrd qualified as InsOrdHashMap

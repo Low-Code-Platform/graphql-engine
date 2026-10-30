@@ -18,7 +18,6 @@ module Hasura.Backends.BigQuery.Parser.Scalars
   )
 where
 
-import Data.Aeson qualified as J
 import Data.Aeson.Ordered qualified as JO
 import Data.Int (Int64)
 import Data.Scientific (Scientific)

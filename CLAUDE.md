@@ -17,6 +17,12 @@ and several packages set it themselves (`schema-parsers`, `test-harness`,
 `upgrade-tests`, `resource-pool`), so an unused import left behind after a
 refactor is a build failure even when it only warns locally.
 
+Beware that an incremental build hides warnings: GHC emits them only for
+modules it actually recompiles, so once a module is cached a later clean-looking
+`cabal build` says nothing about it. Cabal keys recompilation on content
+hashes, so `touch` will not force one either. To get the gate CI applies, build
+with `--ghc-options=-Werror`.
+
 A clean build is not evidence that the engine works. It is routine for the
 engine to compile and then fail to boot, so verify behaviour as well as types:
 `server/CONTRIBUTING.md` has the unit and integration suite commands, and

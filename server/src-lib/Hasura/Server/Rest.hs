@@ -5,8 +5,6 @@ module Hasura.Server.Rest
 where
 
 import Control.Monad.Trans.Control (MonadBaseControl)
-import Data.Aeson
-import Data.Aeson qualified as J
 import Data.Aeson.Ordered qualified as JO
 import Data.Align qualified as Align
 import Data.Environment qualified as Env

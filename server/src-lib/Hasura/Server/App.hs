@@ -36,8 +36,6 @@ import Control.Monad.Trans.Control (MonadBaseControl)
 import Data.Aeson
 import Data.Aeson qualified as J
 import Data.Aeson.Encoding qualified as J
-import Data.Aeson.Key qualified as K
-import Data.Aeson.KeyMap qualified as KM
 import Data.Aeson.Ordered qualified as JO
 import Data.Aeson.Types qualified as J
 import Data.ByteString.Builder qualified as BB
