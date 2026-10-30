@@ -159,7 +159,8 @@ change reversible and keeps the risk in §7 opt-in.
    untouched. The separate worry this raises — that an order-insensitive `Eq` might cause two
    differently-ordered documents to be *conflated* and stored identically — was tested directly:
    two rows inserted by a **single** mutation whose only difference is key order are stored with
-   their own distinct orders (§11, case 5).
+   their own distinct orders (§11, case 5). Cohort sharing itself was then measured rather than left
+   as an argument from the instance definitions; see §11.5.
 3. **Hot-path performance.** `InsOrdHashMap` is slower than `Map` for lookup and carries more
    allocation. Variables are typically small, so the effect should be modest, but it lands on the
    per-request path and needs measurement, not assumption.
@@ -312,3 +313,45 @@ derived from those bytes changes with it: a checksum or ETag computed over the s
 against a golden file, a test asserting the sorted form. Duplicate keys also now keep the last
 value rather than the first (§7 risk 4). `jsonb` columns, inline literals, and every non-`json`
 scalar are untouched. The escape hatch exists for exactly these cases.
+
+### 11.5 Websockets and subscription cohorts, measured
+
+Neither was covered by the HTTP cases in §11.2, and the websocket path has its own
+variable-substitution site (`withOrderedStartMsgVariables`, which reads `payload` out of the raw
+frame rather than the request body). Both were therefore verified against a live engine with a
+dependency-free RFC 6455 client.
+
+**Websockets.** An out-of-order document sent as a mutation variable over websockets, on both
+subprotocols the engine accepts — apollo `graphql-ws` (`start`) and `graphql-transport-ws`
+(`subscribe`), which both land in `CMStart`:
+
+| | default | `disable_ordered_json_input` |
+| --- | --- | --- |
+| apollo `start` | `{"zebra":1,"apple":2,"b":3,"aardvark":4}` | `{"aardvark":4,"apple":2,"b":3,"zebra":1}` |
+| graphql-ws `subscribe` | `{"zebra":1,"apple":2,"b":3,"aardvark":4}` | `{"aardvark":4,"apple":2,"b":3,"zebra":1}` |
+
+Ordinary subscriptions still work on both subprotocols, which matters because `CMStart` is the
+branch that serves them and it is the branch this change touches.
+
+**Cohort sharing.** Two concurrent subscribers on the same subscription whose variables differ only
+in key order, inspected via `/dev/subscriptions/extended`:
+
+| | pollers | cohorts |
+| --- | --- | --- |
+| same value, different key order | 1 | **1** |
+| control: genuinely different values | 1 | 2 |
+
+The single cohort's `current_ops` carries both operation ids, and its `variables` show one
+normalized `synthetic` entry. The control establishes that the measurement can distinguish the two
+cases at all, so the first row is a real sharing result rather than an artifact of how it was read.
+
+**A cohort divergence that cannot currently be reached.** Cohort keys are built from *text-encoded*
+variable values, and `PGValJSONRaw` encodes raw ordered bytes — so two subscriptions filtering a
+`json` column by order-differing values would in principle land in different cohorts where
+previously they shared one. That case is unreachable today: Postgres has no equality operator for
+`json` (`operator does not exist: json = json`), so although Hasura does expose `_eq` on
+`json_comparison_exp`, such a filter fails at the database with or without this change. Worth
+recording because the reasoning does not generalise — if `json` columns ever gain a working
+equality comparison this becomes live, and the fix would be to key cohorts on the sorted form.
+`jsonb` variables are unaffected: they still go through `PGValJSONB`, whose text encoding is
+aeson's and therefore order-independent.
