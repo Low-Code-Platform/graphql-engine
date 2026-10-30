@@ -37,6 +37,20 @@ CREATE TABLE hdb_catalog.hdb_metadata
   resource_version INTEGER NOT NULL DEFAULT 1 UNIQUE
 );
 
+-- Phase 2 (per-(source, schema) metadata storage): each (source, DB schema)'s
+-- table groups live here, with hdb_metadata above holding only the skeleton.
+-- Added by migration 48_to_49.sql; a fresh install initialises straight to
+-- catalog version 49, so it has to be created here too.
+-- See rfcs/per-schema-gql-context.md §11.
+CREATE TABLE hdb_catalog.hdb_metadata_partition
+(
+  source_name      TEXT    NOT NULL,
+  schema_name      TEXT    NOT NULL,
+  partition        JSONB   NOT NULL,
+  resource_version INTEGER NOT NULL DEFAULT 1,
+  PRIMARY KEY (source_name, schema_name)
+);
+
 CREATE TABLE hdb_catalog.hdb_action_log
 (
   id UUID PRIMARY KEY DEFAULT hdb_catalog.gen_hasura_uuid(),

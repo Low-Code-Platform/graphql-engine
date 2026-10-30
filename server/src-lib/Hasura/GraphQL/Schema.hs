@@ -279,7 +279,13 @@ buildGQLContext
     adminPairResults <-
       case HashMap.lookup adminRoleName perRolePairContexts of
         Just r -> pure r
-        Nothing -> throw500 "buildGQLContext failed to build for the admin role"
+        -- A deployment with no sources tracked yet (a fresh install, before
+        -- 'add_source') has no (source, schema) pairs at all, so the admin role
+        -- having no per-pair results is correct: the schema is empty. Only treat
+        -- it as a bug when pairs do exist and admin is somehow absent.
+        Nothing
+          | HashMap.null perPairParsers -> pure mempty
+          | otherwise -> throw500 "buildGQLContext failed to build for the admin role"
     let adminIntrospection = mergeSchemaIntrospections $ view _3 <$> HashMap.elems adminPairResults
 
     -- The unauthenticated context, per pair. Admin-only deployment (locked
