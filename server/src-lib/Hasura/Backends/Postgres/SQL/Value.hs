@@ -96,7 +96,8 @@ data PGScalarValue
   | PGNull PGScalarType
   | PGValJSON PG.JSON
   | -- | Pre-serialized JSON text bound for a @json@ column, used instead of
-    -- 'PGValJSON' when 'Hasura.Server.Types.EFOrderedJsonInput' is on. Carrying
+    -- 'PGValJSON' unless 'Hasura.Server.Types.EFDisableOrderedJsonInput' is
+    -- set. Carrying
     -- the bytes rather than an aeson 'Value' is the whole point: aeson's
     -- @KeyMap@ would re-sort the object keys on the way back out.
     --

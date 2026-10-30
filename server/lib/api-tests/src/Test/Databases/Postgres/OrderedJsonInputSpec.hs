@@ -1,8 +1,10 @@
 {-# LANGUAGE QuasiQuotes #-}
 
 -- |
--- Tests that the @ordered_json_input@ experimental feature preserves the key
--- order a client sent when writing to a Postgres @json@ column.
+-- Tests that the key order a client sent is preserved when writing to a Postgres
+-- @json@ column, which is the default, and that the
+-- @disable_ordered_json_input@ escape hatch restores the old alphabetical
+-- sorting.
 --
 -- Two things are being distinguished throughout, and they are easy to conflate:
 --
@@ -37,12 +39,13 @@ import Test.Hspec (SpecWith, describe, it)
 
 spec :: SpecWith GlobalTestEnvironment
 spec = do
-  Fixture.hgeWithEnv [("HASURA_GRAPHQL_EXPERIMENTAL_FEATURES", "ordered_json_input")]
-    $ Fixture.run (NE.fromList [postgresFixture]) orderPreservedTests
+  -- Order preservation is the default, so this needs no env at all.
+  Fixture.run (NE.fromList [postgresFixture]) orderPreservedTests
 
-  -- The same mutations with the feature off: the historical alphabetical
+  -- The same mutations with the escape hatch set: the historical alphabetical
   -- behaviour must be exactly what it always was.
-  Fixture.run (NE.fromList [postgresFixture]) orderSortedTests
+  Fixture.hgeWithEnv [("HASURA_GRAPHQL_EXPERIMENTAL_FEATURES", "disable_ordered_json_input")]
+    $ Fixture.run (NE.fromList [postgresFixture]) orderSortedTests
   where
     postgresFixture =
       (Fixture.fixture $ Fixture.Backend Postgres.backendTypeMetadata)
@@ -126,7 +129,7 @@ storedText testEnvironment rowId =
 -- Tests
 
 orderPreservedTests :: SpecWith TestEnvironment
-orderPreservedTests = describe "with ordered_json_input enabled" do
+orderPreservedTests = describe "by default" do
   it "preserves variable key order in a json column, and normalizes jsonb" \testEnvironment -> do
     _ <- insertRaw testEnvironment 1 outOfOrderDoc outOfOrderDoc
 
@@ -188,7 +191,7 @@ orderPreservedTests = describe "with ordered_json_input enabled" do
       |]
 
 orderSortedTests :: SpecWith TestEnvironment
-orderSortedTests = describe "with ordered_json_input disabled (default)" do
+orderSortedTests = describe "with disable_ordered_json_input set" do
   it "sorts json column keys alphabetically, as it always has" \testEnvironment -> do
     _ <- insertRaw testEnvironment 1 outOfOrderDoc outOfOrderDoc
 

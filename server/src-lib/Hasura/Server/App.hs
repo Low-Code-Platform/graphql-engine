@@ -247,33 +247,39 @@ parseBody reqBody =
     Left e -> throw400 InvalidJSON (T.pack e)
     Right jVal -> (jVal,) <$> decodeValue jVal
 
--- | As 'parseBody', but restores the key order of GraphQL variable values when
--- 'EFOrderedJsonInput' is enabled.
+-- | As 'parseBody', but keeps the key order of GraphQL variable values.
 --
--- Decoding itself is untouched: the body goes through 'parseBody' exactly as
--- before, so accepted requests, rejected requests, and error messages are all
--- unchanged. Only when the feature is on do we additionally parse the body with
--- an order-preserving decoder and swap the ordered values into the
--- already-decoded variables map, so a deployment that has not opted in does not
--- pay for the second parse.
+-- This is the default path, so it parses the body /once/, with the
+-- order-preserving decoder, and derives the aeson 'Value' the rest of the
+-- pipeline wants via 'JO.fromOrdered'. An earlier version left 'parseBody'
+-- alone and parsed a second time to recover the order, which was the right
+-- trade while the behaviour was opt-in — nobody who had not asked for it paid
+-- anything — but it would put a second full parse of every request body on the
+-- hot path now that it is on by default.
 --
--- A failure of that second parse is deliberately ignored rather than propagated:
--- 'parseBody' has already accepted these bytes as valid JSON, and a disagreement
--- between the two parsers must not turn a working request into a rejected one.
+-- Structural decoding and all of its error messages are therefore unchanged:
+-- 'decodeValue' still runs, on an aeson 'Value' identical to the one aeson's own
+-- parser would have produced. The one difference is the message for a body that
+-- is not valid JSON at all, which now comes from the ordered decoder.
+--
+-- When 'EFDisableOrderedJsonInput' is set this falls back to 'parseBody'
+-- verbatim, so the escape hatch is a true revert to the previous behaviour
+-- rather than an approximation of it.
 parseBodyWithOrderedVariables ::
   (FromJSON a, MonadError QErr m) =>
   S.HashSet ExperimentalFeature ->
   (JO.Value -> a -> a) ->
   BL.ByteString ->
   m (Value, a)
-parseBodyWithOrderedVariables expFeatures restoreOrder reqBody = do
-  (jVal, parsed) <- parseBody reqBody
-  pure
-    ( jVal,
-      if EFOrderedJsonInput `S.member` expFeatures
-        then either (const parsed) (`restoreOrder` parsed) (JO.eitherDecode reqBody)
-        else parsed
-    )
+parseBodyWithOrderedVariables expFeatures restoreOrder reqBody
+  | EFDisableOrderedJsonInput `S.member` expFeatures = parseBody reqBody
+  | otherwise =
+      case JO.eitherDecode reqBody of
+        Left e -> throw400 InvalidJSON (T.pack e)
+        Right joVal -> do
+          let jVal = JO.fromOrdered joVal
+          parsed <- decodeValue jVal
+          pure (jVal, restoreOrder joVal parsed)
 
 onlyAdmin :: (MonadError QErr m, MonadReader HandlerCtx m) => m ()
 onlyAdmin = do
@@ -1036,7 +1042,7 @@ httpApp setupHook appStateRef AppEnv {..} consoleType ekgStore closeWebsocketsOn
     -- us to pass non-scalar values.
     -- Decoded with the order-preserving parser rather than aeson so that a
     -- JSON object passed to a REST endpoint keeps its key order; see
-    -- 'EFOrderedJsonInput'. This replaces the aeson parse rather than adding
+    -- 'EFDisableOrderedJsonInput'. This replaces the aeson parse rather than adding
     -- one, so it costs nothing when the feature is off.
     let bodyParams = case JO.decode body of
           Just (JO.Object o) -> JO.toList o

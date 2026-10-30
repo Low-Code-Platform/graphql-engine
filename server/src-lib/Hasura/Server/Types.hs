@@ -135,19 +135,31 @@ data ExperimentalFeature
     --
     -- See @rfcs/phase9-per-table-field-cache.md@.
     EFDisablePerTableSchemaCache
-  | -- | Preserve the client's JSON object key order when writing to a Postgres
-    -- @json@ column, instead of storing the keys alphabetically sorted.
+  | -- | Turn OFF preservation of the client's JSON object key order when
+    -- writing to a Postgres @json@ column, restoring the alphabetical sorting
+    -- the engine used to apply.
     --
-    -- Only @json@ columns are affected. @jsonb@ decomposes into a binary form
-    -- that re-sorts keys (by length, then bytewise) and drops duplicates, so
-    -- nothing upstream of a @jsonb@ column can preserve order.
+    -- Order preservation is ON by default. A @json@ column stores its document
+    -- verbatim, so the key order a client sends is observable afterwards, and
+    -- sorting it was the engine imposing itself on data it was asked to store
+    -- as-is.
+    --
+    -- Only @json@ columns are affected either way. @jsonb@ decomposes into a
+    -- binary form that re-sorts keys (by length, then bytewise) and drops
+    -- duplicates, so nothing upstream of a @jsonb@ column can preserve order.
     --
     -- The order is faithful for values supplied as GraphQL /variables/. Inline
     -- object literals are unaffected: they lose their order earlier, in the
-    -- GraphQL parser's AST, and continue to be stored alphabetically.
+    -- GraphQL parser's AST, and are always stored alphabetically.
+    --
+    -- This is an escape hatch, for a deployment that depends on the old
+    -- alphabetical bytes — a checksum or ETag computed over the stored text,
+    -- say, or a test asserting the sorted form. Setting it also reverts the
+    -- request-body decode to aeson's, so it is a true revert rather than an
+    -- approximation.
     --
     -- See @rfcs/ordered-json-input.md@.
-    EFOrderedJsonInput
+    EFDisableOrderedJsonInput
   deriving (Bounded, Enum, Eq, Generic, Show)
 
 experimentalFeatureKey :: ExperimentalFeature -> Text
@@ -167,7 +179,7 @@ experimentalFeatureKey = \case
   EFRemoveEmptySubscriptionResponses -> "remove_empty_subscription_responses"
   EFEnableRelaySchema -> "enable_relay_schema"
   EFDisablePerTableSchemaCache -> "disable_per_table_schema_cache"
-  EFOrderedJsonInput -> "ordered_json_input"
+  EFDisableOrderedJsonInput -> "disable_ordered_json_input"
 
 instance Hashable ExperimentalFeature
 

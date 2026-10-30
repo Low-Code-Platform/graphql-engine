@@ -1168,7 +1168,7 @@ onMessage enabledLogTypes authMode serverEnv wsConn msgRaw onMessageActions agen
     keepAliveMessageAction = WS._wsaKeepAliveAction onMessageActions
 
 -- | Restore the key order of variable values in a @start@ \/ @subscribe@ message
--- when 'EFOrderedJsonInput' is enabled.
+-- unless 'EFDisableOrderedJsonInput' is set.
 --
 -- The websocket counterpart of
 -- 'Hasura.Server.App.parseBodyWithOrderedVariables': the message has already
@@ -1178,7 +1178,7 @@ onMessage enabledLogTypes authMode serverEnv wsConn msgRaw onMessageActions agen
 -- difference from the HTTP path.
 withOrderedStartMsgVariables :: Set.HashSet ExperimentalFeature -> LBS.ByteString -> StartMsg -> StartMsg
 withOrderedStartMsgVariables expFeatures msgRaw startMsg@(StartMsg opId reqUnparsed)
-  | EFOrderedJsonInput `Set.member` expFeatures,
+  | not (EFDisableOrderedJsonInput `Set.member` expFeatures),
     Right (JO.Object msgObj) <- JO.eitherDecode msgRaw,
     Just payload <- JO.lookup "payload" msgObj =
       StartMsg opId (withOrderedVariables payload reqUnparsed)

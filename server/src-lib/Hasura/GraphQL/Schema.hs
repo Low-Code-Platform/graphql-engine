@@ -466,9 +466,9 @@ buildSchemaOptions
         soRemoveEmptySubscriptionResponses =
           removeEmptySubscriptionResponses,
         soOrderedJsonInput =
-          if EFOrderedJsonInput `Set.member` expFeatures
-            then Options.PreserveJsonInputOrder
-            else Options.SortJsonInputKeys
+          if EFDisableOrderedJsonInput `Set.member` expFeatures
+            then Options.SortJsonInputKeys
+            else Options.PreserveJsonInputOrder
       }
 
 -- | Assemble the per-role GQL context from pre-computed source parsers plus

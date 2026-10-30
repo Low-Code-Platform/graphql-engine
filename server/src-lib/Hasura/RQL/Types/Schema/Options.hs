@@ -207,7 +207,7 @@ data UsePostgresArrays
 -- sent, or store the keys alphabetically sorted as the engine always has?
 --
 -- Affects @json@ only; @jsonb@ re-sorts on storage regardless. See
--- 'Hasura.Server.Types.EFOrderedJsonInput'.
+-- 'Hasura.Server.Types.EFDisableOrderedJsonInput'.
 data OrderedJsonInput
   = PreserveJsonInputOrder
   | SortJsonInputKeys

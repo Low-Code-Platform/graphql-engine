@@ -7,10 +7,11 @@ stored in Postgres. Keys come back sorted alphabetically. This RFC describes wha
 to preserve the client's key order end-to-end, why it is not a configuration switch, and a phased
 design scoped to the only case that can actually benefit.
 
-**Status: implemented** behind the `ordered_json_input` experimental feature, defaulting off.
+**Status: implemented and ON by default**, with `disable_ordered_json_input` as an escape hatch.
 See §11 for what shipped, and §7 for the two risks that were open when this was written and have
-now been measured. §8 remains a valid zero-engine-change alternative for deployments that would
-rather not enable a feature flag.
+now been measured. It first shipped opt-in as `ordered_json_input`; §11.4 records the flip and what
+had to change to make it a sane default. §8 remains a valid zero-engine-change alternative for
+anyone on a released build.
 
 ## 2. Observed behaviour (measured)
 
@@ -220,23 +221,25 @@ Note this is the same "JSON in disguise" heuristic the engine already applies to
 
 ## 10. Decision
 
-Implemented as Phase 1, behind `ordered_json_input`, defaulting off. §5 still holds: the addressable
-scope is `json`-column users only, which is why this is opt-in rather than the default. Phase 2
-(inline literals, §6.3) was **not** taken — it requires changing `VObject` in the separately
+Implemented as Phase 1 and made the default, with `disable_ordered_json_input` to turn it off. §5
+still holds — only `json`-column users are affected — but the conclusion drawn from it changed: a
+`json` column stores its document verbatim, so sorting its keys was the engine imposing itself on
+data it was asked to store as-is, and the users affected are exactly the ones who would want it.
+Phase 2 (inline literals, §6.3) was **not** taken — it requires changing `VObject` in the separately
 published `graphql-parser` library, and clients that care about byte fidelity send documents as
 variables.
 
 ## 11. What shipped
 
-Enable with `HASURA_GRAPHQL_EXPERIMENTAL_FEATURES=ordered_json_input` (metadata key
-`ordered_json_input`). Only Postgres `json` columns change behaviour; everything else — including
-`jsonb` — is byte-identical to the feature being off.
+On by default. Turn it off with
+`HASURA_GRAPHQL_EXPERIMENTAL_FEATURES=disable_ordered_json_input`. Only Postgres `json` columns
+change behaviour; everything else — including `jsonb` — is byte-identical either way.
 
 ### 11.1 Code
 
 | Loss point | What changed |
 | --- | --- |
-| L1 | `VariableValues` is now `HashMap G.Name JO.Value` (`Transport/HTTP/Protocol.hs`). Request bodies are still decoded by aeson, unchanged; `withOrderedVariables` / `withOrderedVariablesInReqs` then swap in the order-preserving values from a second, order-preserving parse of the same bytes. Wired at `Server/App.hs` (`parseBodyWithOrderedVariables`, for `/v1/graphql` and persisted queries) and `Transport/WebSocket.hs` (`withOrderedStartMsgVariables`, for `start`/`subscribe`). Both are gated on the feature, so the second parse costs nothing when it is off. REST custom endpoints decode their body params with `JO.decode` instead of aeson (`Server/App.hs`) — a replacement, not an extra parse, so that one is ungated. |
+| L1 | `VariableValues` is now `HashMap G.Name JO.Value` (`Transport/HTTP/Protocol.hs`). The body is parsed **once**, with the order-preserving decoder, and the aeson `Value` the rest of the pipeline wants is derived via `JO.fromOrdered`; `withOrderedVariables` / `withOrderedVariablesInReqs` then substitute the ordered values. Structural decoding still goes through `decodeValue` on that derived value, so its validation and error messages are unchanged — only the message for a body that is not valid JSON at all now comes from the ordered decoder. Wired at `Server/App.hs` (`parseBodyWithOrderedVariables`, for `/v1/graphql` and persisted queries) and `Transport/WebSocket.hs` (`withOrderedStartMsgVariables`, for `start`/`subscribe`). Setting `disable_ordered_json_input` falls back to `parseBody` verbatim, so the escape hatch is a true revert. REST custom endpoints decode their body params with `JO.decode` instead of aeson. |
 | L2 | Untouched (Phase 2 not taken). Inline object literals are still stored alphabetically. |
 | L3 | `valueToOrderedJSON` added alongside `valueToJSON`, which is now defined as `fmap JO.fromOrdered . valueToOrderedJSON` so there is one conversion to keep correct. `graphQLToOrderedJSON` sorts inline-literal keys explicitly, preserving today's alphabetical output rather than leaking an arbitrary hash order. |
 | L4 | `PGValJSONRaw !Text` added to `PGScalarValue`, carrying pre-serialized bytes; `txtEncodedVal` emits them verbatim and `binEncoder` sends them as `(PTI.json, Text)`. Constructed only by the `(PGJSON, PreserveJsonInputOrder)` branch of `columnParser` (`Backends/Postgres/Instances/Schema.hs`). |
@@ -255,7 +258,8 @@ so the fallback branch cannot silently emit an unescaped document if the array p
 
 ### 11.2 Measured, against Postgres 16.13
 
-Each case run twice against the same engine build, with the feature on and off. `json` values are
+Each case run twice against the same engine build, with the behaviour on (default) and off
+(`disable_ordered_json_input`). `json` values are
 read back as text via `run_sql`, because any assertion that parses the value cannot see key order.
 Document sent: `{"zebra":1,"apple":2,"b":3,"aardvark":4}`.
 
@@ -281,3 +285,30 @@ Case 5 is the one that matters for risk 2, and case 1's `jsonb` row for §5.
   re-sorts object keys, so a test that builds its body through aeson cannot send an out-of-order
   document in the first place. That is risk 5 in miniature — fidelity is bounded by the client.
 - `graphql-engine-tests`: 1281 examples, 0 failures.
+
+### 11.4 Flipping the default
+
+It shipped opt-in as `ordered_json_input`, then was made the default with
+`disable_ordered_json_input` as the escape hatch, following the shape of
+`EFDisablePerTableSchemaCache`. Two things had to change for that to be defensible.
+
+**The double parse had to go.** While the behaviour was opt-in, the implementation deliberately left
+`parseBody` alone and parsed the body a *second* time with the ordered decoder, purely to recover
+the key order. That was the right trade then — a deployment that had not asked for the feature paid
+nothing, and the aeson parse kept every error message identical. As the default it is indefensible:
+it puts a full extra JSON parse of every GraphQL request body on the hot path for everyone. So the
+default path now parses once, with the ordered decoder, and derives the aeson `Value` via
+`JO.fromOrdered`. This is risk 3 in §7, resolved by removing the cost rather than measuring it.
+
+The cost of that: the error message for a body that is not valid JSON at all now comes from the
+ordered decoder's attoparsec parser rather than aeson's. Structural errors are unaffected —
+`decodeValue` still runs on an aeson `Value` identical to what aeson's own parser would have built.
+Setting `disable_ordered_json_input` restores `parseBody` verbatim, so the hatch is a true revert
+and not an approximation.
+
+**What a deployment can notice.** Stored key order in `json` columns changes from alphabetical to
+whatever the client sent. That is the point, but it is a change to bytes on disk, so anything
+derived from those bytes changes with it: a checksum or ETag computed over the stored text, a diff
+against a golden file, a test asserting the sorted form. Duplicate keys also now keep the last
+value rather than the first (§7 risk 4). `jsonb` columns, inline literals, and every non-`json`
+scalar are untouched. The escape hatch exists for exactly these cases.
