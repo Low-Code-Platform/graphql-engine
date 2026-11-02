@@ -12,7 +12,6 @@ import Data.Aeson (Value, toJSON)
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet qualified as HS
 import Data.IORef (modifyIORef', newIORef, readIORef)
-import Data.Text.NonEmpty (mkNonEmptyTextUnsafe)
 import Hasura.Authentication.Role (adminRoleName)
 import Hasura.Backends.Postgres.Instances.Schema ()
 import Hasura.Backends.Postgres.SQL.Types (QualifiedTable, SchemaName (..))

@@ -12,7 +12,7 @@ import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet qualified as HS
 import Data.Text.NonEmpty (mkNonEmptyTextUnsafe)
 import Hasura.Backends.Postgres.Instances.Schema ()
-import Hasura.Backends.Postgres.SQL.Types (QualifiedTable, TableName (..))
+import Hasura.Backends.Postgres.SQL.Types (QualifiedTable)
 import Hasura.GraphQL.Schema.TableDeps (invalidatedTables, tableDependencyGraph)
 import Hasura.Prelude
 import Hasura.RQL.Types.BackendType (BackendType (..), PostgresKind (..))
