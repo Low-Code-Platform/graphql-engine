@@ -10,6 +10,7 @@ module Hasura.RQL.DML.Internal
     askTableInfoSource,
     askUpdPermInfo,
     binRHSBuilder,
+    binRHSBuilderOrdered,
     checkPermOnCol,
     checkRetCols,
     checkSelOnCol,
@@ -48,7 +49,9 @@ import Hasura.Backends.Postgres.Translate.Column
 import Hasura.Backends.Postgres.Types.Column
 import Hasura.Base.Error
 import Hasura.LogicalModel.Fields (LogicalModelFieldsRM)
+import Data.Aeson.Ordered qualified as JO
 import Hasura.Prelude
+import Hasura.RQL.Types.Schema.Options qualified as Options
 import Hasura.RQL.DDL.Permission (annBoolExp)
 import Hasura.RQL.IR.BoolExp
 import Hasura.RQL.Types.Backend
@@ -227,6 +230,35 @@ binRHSBuilder colType val = do
   scalarValue <- parseScalarValueColumnTypeWithContext () colType val
   put (preparedArgs DS.|> binEncoder scalarValue)
   return $ toPrepParam (DS.length preparedArgs + 1) (unsafePGColumnToBackend colType)
+
+-- | 'binRHSBuilder' for insert values, which arrive as insertion-ordered
+-- 'JO.Value's.
+--
+-- Identical to 'binRHSBuilder' in every case but one: a non-null value bound for
+-- a @json@ column is turned into 'PGValJSONRaw', carrying the already-serialized
+-- bytes in the client's key order, instead of being parsed into an aeson 'Value'
+-- whose @KeyMap@ would sort the keys. @jsonb@ is deliberately excluded —
+-- Postgres re-sorts it on storage regardless, so taking this path for it would
+-- add cost and change nothing.
+--
+-- 'binRHSBuilder' itself is left alone because it is shared with select, update
+-- and delete, where the value is a comparison operand rather than something
+-- stored verbatim.
+binRHSBuilderOrdered ::
+  (QErrM m) =>
+  Options.OrderedJsonInput ->
+  ColumnType ('Postgres 'Vanilla) ->
+  JO.Value ->
+  DMLP1T m S.SQLExp
+binRHSBuilderOrdered orderedJsonInput colType val = case (orderedJsonInput, colType, val) of
+  -- JO.Null must still go through the ordinary path so that nullability
+  -- checking and the 'PGNull' encoding are unchanged.
+  (Options.PreserveJsonInputOrder, ColumnScalar PGJSON, _)
+    | val /= JO.Null -> do
+        preparedArgs <- get
+        put (preparedArgs DS.|> binEncoder (pgValJSONRawFromOrdered val))
+        return $ toPrepParam (DS.length preparedArgs + 1) (unsafePGColumnToBackend colType)
+  _ -> binRHSBuilder colType (JO.fromOrdered val)
 
 fetchRelTabInfo ::
   (QErrM m, TableInfoRM ('Postgres 'Vanilla) m) =>

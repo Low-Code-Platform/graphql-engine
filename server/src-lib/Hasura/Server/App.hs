@@ -18,6 +18,7 @@ module Hasura.Server.App
     configApiGetHandler,
     isAdminSecretSet,
     mkGetHandler,
+    mkPostHandlerWithOrderedJson,
     mkSpockAction,
     mkWaiApp,
     onlyAdmin,
@@ -191,6 +192,15 @@ data APIHandler m a where
   AHGet :: !(Handler m (HttpLogGraphQLInfo, APIResp)) -> APIHandler m void
   -- | A simple POST request that expects a request body from which an 'a' can be extracted
   AHPost :: !(a -> Handler m (HttpLogGraphQLInfo, APIResp)) -> APIHandler m a
+  -- | As 'AHPost', but the body is additionally parsed with the
+  -- order-preserving decoder and the given function folds the ordered value
+  -- back into the decoded request. Used by the RQL query endpoints so that key
+  -- order inside an insert's @objects@ survives; see
+  -- 'Hasura.RQL.DML.Types.withOrderedInsertObjects'.
+  AHPostWithOrderedJson ::
+    !(JO.Value -> a -> a) ->
+    !(a -> Handler m (HttpLogGraphQLInfo, APIResp)) ->
+    APIHandler m a
   -- | A general GraphQL request (query or mutation) for which the content of the query
   -- is made available to the handler for authentication.
   -- This is a more specific version of the 'AHPost' constructor.
@@ -209,6 +219,12 @@ mkGetHandler = AHGet
 
 mkPostHandler :: (a -> Handler m (HttpLogGraphQLInfo, APIResp)) -> APIHandler m a
 mkPostHandler = AHPost
+
+mkPostHandlerWithOrderedJson ::
+  (JO.Value -> a -> a) ->
+  (a -> Handler m (HttpLogGraphQLInfo, APIResp)) ->
+  APIHandler m a
+mkPostHandlerWithOrderedJson = AHPostWithOrderedJson
 
 mkGQLRequestHandler :: (GH.ReqsText -> Handler m (HttpLogGraphQLInfo, APIResp)) -> APIHandler m GH.ReqsText
 mkGQLRequestHandler = AHGraphQLRequest
@@ -408,6 +424,13 @@ mkSpockAction appStateRef qErrEncoder qErrModifier apiHandler = do
         (userInfo, authHeaders, handlerState, includeInternal, extraUserInfo) <- getInfo Nothing
         (queryJSON, parsedReq) <-
           runExcept (parseBody reqBody)
+            `onLeft` logErrorAndResp (Just userInfo) requestId req (reqBody, Nothing) includeInternal Nothing origHeaders extraUserInfo
+        res <- lift $ runHandler (_lsLogger appEnvLoggers) handlerState $ handler parsedReq
+        pure (res, userInfo, authHeaders, includeInternal, Just queryJSON, extraUserInfo)
+      AHPostWithOrderedJson restoreOrder handler -> do
+        (userInfo, authHeaders, handlerState, includeInternal, extraUserInfo) <- getInfo Nothing
+        (queryJSON, parsedReq) <-
+          runExcept (parseBodyWithOrderedVariables acExperimentalFeatures restoreOrder reqBody)
             `onLeft` logErrorAndResp (Just userInfo) requestId req (reqBody, Nothing) includeInternal Nothing origHeaders extraUserInfo
         res <- lift $ runHandler (_lsLogger appEnvLoggers) handlerState $ handler parsedReq
         pure (res, userInfo, authHeaders, includeInternal, Just queryJSON, extraUserInfo)
@@ -1067,7 +1090,7 @@ httpApp setupHook appStateRef AppEnv {..} consoleType ekgStore closeWebsocketsOn
     onlyWhenApiEnabled isMetadataEnabled appStateRef
       $ mkSpockAction appStateRef encodeQErr id
       $ do
-        mkPostHandler $ fmap (emptyHttpLogGraphQLInfo,) <$> mkAPIRespHandler (v1QueryHandler schemaCacheUpdater)
+        mkPostHandlerWithOrderedJson withOrderedRQLInsertObjects $ fmap (emptyHttpLogGraphQLInfo,) <$> mkAPIRespHandler (v1QueryHandler schemaCacheUpdater)
 
   Spock.post "v1/metadata" $ do
     onlyWhenApiEnabled isMetadataEnabled appStateRef
@@ -1079,7 +1102,7 @@ httpApp setupHook appStateRef AppEnv {..} consoleType ekgStore closeWebsocketsOn
   Spock.post "v2/query" $ do
     onlyWhenApiEnabled isMetadataEnabled appStateRef
       $ mkSpockAction appStateRef encodeQErr id
-      $ mkPostHandler
+      $ mkPostHandlerWithOrderedJson V2Q.withOrderedRQLInsertObjects
       $ fmap (emptyHttpLogGraphQLInfo,)
       <$> mkAPIRespHandler (v2QueryHandler schemaCacheUpdater)
 

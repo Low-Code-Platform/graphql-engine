@@ -33,6 +33,7 @@ module Harness.GraphqlEngine
     postGraphqlWithHeaders,
     postWithHeadersStatus,
     postGraphqlRaw,
+    postV2QueryRaw,
     clearMetadata,
     postV1Query,
     postV2Query,
@@ -174,6 +175,25 @@ postGraphqlRaw testEnv@(getServer -> Server {urlPrefix, port}) rawBody =
         (addAuthzHeaders testEnv mempty)
         rawBody
     testLogMessage testEnv $ LogHGEResponse "/v1/graphql" responseBody
+    pure responseBody
+
+-- | Post a raw, already-serialized body to @\/v2\/query@.
+--
+-- The RQL query API decodes its body separately from GraphQL, so a test that
+-- cares about JSON key order has to exercise it directly — and has to send the
+-- bytes itself, because building the body through aeson would sort the keys
+-- before the request ever left.
+postV2QueryRaw :: (HasCallStack) => TestEnvironment -> Char8.ByteString -> IO Value
+postV2QueryRaw testEnv@(getServer -> Server {urlPrefix, port}) rawBody =
+  withFrozenCallStack $ do
+    testLogMessage testEnv $ LogHGERequest "/v2/query" $ String $ T.pack $ Char8.unpack rawBody
+    responseBody <-
+      Http.postRawValueWithStatus
+        200
+        (urlPrefix ++ ":" ++ show port ++ "/v2/query")
+        (addAuthzHeaders testEnv mempty)
+        rawBody
+    testLogMessage testEnv $ LogHGEResponse "/v2/query" responseBody
     pure responseBody
 
 addAuthzHeaders :: TestEnvironment -> Http.RequestHeaders -> Http.RequestHeaders

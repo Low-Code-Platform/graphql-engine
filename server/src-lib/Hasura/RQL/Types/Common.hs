@@ -306,7 +306,12 @@ data SQLGenCtx = SQLGenCtx
     removeEmptySubscriptionResponses :: Options.RemoveEmptySubscriptionResponses,
     remoteNullForwardingPolicy :: Options.RemoteNullForwardingPolicy,
     optimizePermissionFilters :: Options.OptimizePermissionFilters,
-    bigqueryStringNumericInput :: Options.BigQueryStringNumericInput
+    bigqueryStringNumericInput :: Options.BigQueryStringNumericInput,
+    -- | Whether a write to a Postgres @json@ column through the legacy RQL
+    -- query API keeps the key order the client sent. The GraphQL path reads
+    -- the equivalent option from 'SchemaOptions'; RQL does not go through
+    -- schema building, so it is carried here instead.
+    orderedJsonInput :: Options.OrderedJsonInput
   }
   deriving (Show, Eq)
 

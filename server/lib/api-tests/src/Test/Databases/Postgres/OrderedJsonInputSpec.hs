@@ -20,6 +20,11 @@
 -- a GraphQL read, because the YAML comparison helpers parse both sides into
 -- aeson values, and that comparison cannot see key order at all.
 --
+-- Covers both transports, which have separate decode paths: GraphQL mutations
+-- and the legacy RQL query API (@\/v2\/query@ @type: insert@). The RQL
+-- /update/ path is deliberately not covered — see
+-- @rfcs\/ordered-json-input.md@ §11.6.
+--
 -- See @rfcs/ordered-json-input.md@.
 module Test.Databases.Postgres.OrderedJsonInputSpec (spec) where
 
@@ -28,7 +33,7 @@ import Data.ByteString.Lazy.Char8 qualified as Char8
 import Data.Text qualified as T
 import Data.List.NonEmpty qualified as NE
 import Harness.Backend.Postgres qualified as Postgres
-import Harness.GraphqlEngine (postGraphqlRaw, postV2Query)
+import Harness.GraphqlEngine (postGraphqlRaw, postV2Query, postV2QueryRaw)
 import Harness.Quoter.Yaml (yaml)
 import Harness.Schema qualified as Schema
 import Harness.Test.Fixture qualified as Fixture
@@ -41,6 +46,7 @@ spec :: SpecWith GlobalTestEnvironment
 spec = do
   -- Order preservation is the default, so this needs no env at all.
   Fixture.run (NE.fromList [postgresFixture]) orderPreservedTests
+  Fixture.run (NE.fromList [postgresFixture]) rqlInsertTests
 
   -- The same mutations with the escape hatch set: the historical alphabetical
   -- behaviour must be exactly what it always was.
@@ -103,6 +109,23 @@ insertRaw testEnvironment rowId doc docb =
     <> doc
     <> ",\"db\":"
     <> docb
+    <> "}}"
+
+-- | Insert through the RQL query API, sending the body as raw bytes.
+--
+-- Raw rather than built from a 'Value': aeson's encoder sorts object keys, so a
+-- body assembled through aeson (or through the @yaml@ quoter, which goes via
+-- aeson) would arrive already sorted and the assertion below would pass no
+-- matter what the engine did.
+rqlInsertRaw :: TestEnvironment -> Text -> IO Value
+rqlInsertRaw testEnvironment objects =
+  postV2QueryRaw testEnvironment
+    $ Char8.pack
+    $ T.unpack
+    $ "{\"type\":\"insert\",\"args\":{\"source\":\"postgres\","
+    <> "\"table\":{\"schema\":\"hasura\",\"name\":\"payloads\"},"
+    <> "\"objects\":"
+    <> objects
     <> "}}"
 
 -- | Read the stored column back as text, which is the only way to observe key
@@ -187,6 +210,59 @@ orderPreservedTests = describe "by default" do
           - - doc
             - docb
           - - '{"aardvark":4,"apple":2,"b":3,"zebra":1}'
+            - '{}'
+      |]
+
+-- | The legacy RQL query API, which decodes its body separately from GraphQL.
+-- This is the path that regressed in practice: it was missed when the GraphQL
+-- transports were done, so it kept storing keys alphabetically.
+rqlInsertTests :: SpecWith TestEnvironment
+rqlInsertTests = describe "RQL query API (type: insert)" do
+  it "preserves key order in a json column" \testEnvironment -> do
+    _ <-
+      rqlInsertRaw
+        testEnvironment
+        "[{\"id\": 40, \"doc\": {\"zebra\":1,\"apple\":2,\"b\":3,\"aardvark\":4}, \"docb\": {}}]"
+
+    shouldReturnYaml
+      testEnvironment
+      (storedText testEnvironment 40)
+      [yaml|
+        result_type: TuplesOk
+        result:
+          - - doc
+            - docb
+          - - '{"zebra":1,"apple":2,"b":3,"aardvark":4}'
+            - '{}'
+      |]
+
+  it "keeps each row's own order when one insert carries several" \testEnvironment -> do
+    -- Two rows differing only in key order must not collapse onto one value.
+    _ <-
+      rqlInsertRaw
+        testEnvironment
+        "[{\"id\": 41, \"doc\": {\"a\":1,\"b\":2}, \"docb\": {}}, {\"id\": 42, \"doc\": {\"b\":2,\"a\":1}, \"docb\": {}}]"
+
+    shouldReturnYaml
+      testEnvironment
+      (storedText testEnvironment 41)
+      [yaml|
+        result_type: TuplesOk
+        result:
+          - - doc
+            - docb
+          - - '{"a":1,"b":2}'
+            - '{}'
+      |]
+    shouldReturnYaml
+      testEnvironment
+      (storedText testEnvironment 42)
+      [yaml|
+        result_type: TuplesOk
+        result:
+          - - doc
+            - docb
+          - - '{"b":2,"a":1}'
             - '{}'
       |]
 

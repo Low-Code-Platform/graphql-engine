@@ -65,7 +65,6 @@ import Hasura.GraphQL.Schema.Parser qualified as P
 import Hasura.GraphQL.Schema.Select
 import Hasura.GraphQL.Schema.Update qualified as SU
 import Hasura.GraphQL.Schema.Update.Batch qualified as SUB
-import Hasura.EncJSON (encJFromOrderedValue, encJToBS)
 import Hasura.LogicalModel.Schema (defaultLogicalModelArgs, defaultLogicalModelSelectionSet)
 import Hasura.Name qualified as Name
 import Hasura.NativeQuery.Schema qualified as NativeQueries
@@ -490,7 +489,7 @@ columnParser columnType nullability = case columnType of
             (PGJSON, Options.PreserveJsonInputOrder) ->
               P.valueToOrderedJSON (P.toGraphQLType schemaType) >=> \case
                 JO.Null -> P.parseError $ "unexpected null value for type " <> toErrorValue name
-                value -> pure $ PGValJSONRaw $ encodeOrderedJsonText value
+                value -> pure $ pgValJSONRawFromOrdered value
             _ ->
               P.valueToJSON (P.toGraphQLType schemaType) >=> \case
                 J.Null -> P.parseError $ "unexpected null value for type " <> toErrorValue name
@@ -505,14 +504,6 @@ columnParser columnType nullability = case columnType of
           . fmap (ColumnValue columnType)
           <$> enumParser @pgKind tableName enumValuesList tableCustomName nullability
       Nothing -> throw400 ValidationFailed "empty enum values"
-
--- | Serialize an ordered JSON value to text with its key order intact.
---
--- Deliberately not @J.encode . JO.fromOrdered@: converting to an aeson 'J.Value'
--- first would put the keys back through a @KeyMap@ and sort them, undoing the
--- only thing this path exists to achieve.
-encodeOrderedJsonText :: JO.Value -> Text
-encodeOrderedJsonText = bsToTxt . encJToBS . encJFromOrderedValue
 
 enumParser ::
   forall pgKind r m n.

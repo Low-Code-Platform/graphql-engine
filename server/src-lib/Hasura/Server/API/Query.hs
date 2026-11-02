@@ -1,6 +1,7 @@
 -- | The RQL query ('/v1/query')
 module Hasura.Server.API.Query
   ( RQLQuery,
+    withOrderedRQLInsertObjects,
     queryModifiesSchemaCache,
     requiresAdmin,
     runQuery,
@@ -21,6 +22,7 @@ import Hasura.Function.API qualified as Functions
 import Hasura.GraphQL.Schema.Common (SchemaSampledFeatureFlags)
 import Hasura.Logging qualified as L
 import Hasura.Metadata.Class
+import Data.Aeson.Ordered qualified as JO
 import Hasura.Prelude
 import Hasura.QueryTags
 import Hasura.RQL.DDL.Action
@@ -141,6 +143,15 @@ data RQLQueryV2
   | RQV2TrackFunction !(Functions.TrackFunctionV2 ('Postgres 'Vanilla))
   | RQV2ReplaceMetadata !ReplaceMetadataV2
   deriving stock (Generic)
+
+-- | Restore key order in an RQL @insert@'s @objects@ from an ordered parse of
+-- the same body. Every other operation is returned unchanged.
+--
+-- Deliberately limited to inserts: see @rfcs/ordered-json-input.md@ §11.6.
+withOrderedRQLInsertObjects :: JO.Value -> RQLQuery -> RQLQuery
+withOrderedRQLInsertObjects bodyVal = \case
+  RQV1 (RQInsert q) -> RQV1 (RQInsert (withOrderedInsertObjects bodyVal q))
+  other -> other
 
 data RQLQuery
   = RQV1 !RQLQueryV1

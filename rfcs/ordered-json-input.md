@@ -236,6 +236,9 @@ On by default. Turn it off with
 `HASURA_GRAPHQL_EXPERIMENTAL_FEATURES=disable_ordered_json_input`. Only Postgres `json` columns
 change behaviour; everything else — including `jsonb` — is byte-identical either way.
 
+Covered transports are listed in §11.6. They are not all of them, and the gap was found in
+production use rather than by this document.
+
 ### 11.1 Code
 
 | Loss point | What changed |
@@ -355,3 +358,54 @@ recording because the reasoning does not generalise — if `json` columns ever g
 equality comparison this becomes live, and the fix would be to key cohorts on the sorted form.
 `jsonb` variables are unaffected: they still go through `PGValJSONB`, whose text encoding is
 aeson's and therefore order-independent.
+
+### 11.6 Transports: what is covered, and the gap this missed
+
+§11.1 described the GraphQL write path as though it were *the* write path. It is not. The engine has
+two JSON entry points with **independent** decoders, and the first version of this work covered only
+one of them:
+
+| Transport | Decoded by | Covered |
+| --- | --- | --- |
+| `/v1/graphql`, persisted queries | `parseBodyWithOrderedVariables` | yes |
+| websocket `start` / `subscribe` | `withOrderedStartMsgVariables` | yes |
+| REST custom endpoints | `JO.decode` of the body params | yes |
+| **RQL query API** `/v1/query`, `/v2/query` — `type: insert` | `AHPostWithOrderedJson` + `withOrderedInsertObjects` | yes, added later |
+| **RQL query API** — `type: update` (`$set`) | plain aeson `parseBody` | **no** |
+| `run_sql` | not parsed by the engine at all | n/a (always preserved) |
+
+The RQL gap was real and user-visible: a `json` column written through
+`{"type":"insert","args":{…}}` kept storing keys alphabetically long after the GraphQL path was
+fixed, because `AHPost` decodes with aeson and `InsObj b = ColumnValues b Value` carried aeson
+values all the way to the column builders. Nothing in the original §11 would have caught it — every
+case measured went through `/v1/graphql`.
+
+**How insert was fixed.** `InsObj` and `InsertQuery.iqObjects` now carry `JO.Value`;
+`decodeOrderedInsObjs` validates with the existing aeson decoder and then substitutes the ordered
+value per column, so acceptance and error messages are unchanged; and `binRHSBuilderOrdered` turns a
+non-null value bound for a `PGJSON` column into `PGValJSONRaw`, delegating every other case to the
+untouched `binRHSBuilder`. That last point is deliberate: `binRHSBuilder` is shared with select,
+update and delete, where a value is a comparison operand rather than something stored verbatim.
+The option reaches the DML layer through a new `SQLGenCtx` field, since RQL does not go through
+schema building and so cannot read `SchemaOptions`.
+
+**Why update was not.** Scoped out by the person asking for it, not by analysis. The cost is an
+inconsistency between two adjacent operations on the same column — an RQL insert preserves order, an
+RQL `$set` update does not — which is the kind of asymmetry that surprises someone later. If it is
+picked up, the work is `UpdateQuery`'s `$set` map and the same `binRHSBuilderOrdered` swap.
+
+**Measured** on the user's own reported payload (`type: insert` to `/v2/query`, `json1 json`
+column), sending `{"zebra":1,"apple":2,"b":3}`:
+
+| path | default | `disable_ordered_json_input` |
+| --- | --- | --- |
+| `/v2/query` insert | `{"zebra":1,"apple":2,"b":3}` | `{"apple":2,"b":3,"zebra":1}` |
+| `/v1/query` insert | preserved | sorted |
+| `/v1/query` insert, two rows with different orders | each row keeps its own | both sorted |
+| `/v1/query` upsert via `on_conflict` | preserved | sorted |
+| `/v1/query` update `$set` | sorted (not covered) | sorted |
+| `jsonb` column via RQL insert | `{"b": 3, "apple": 2, "zebra": 1}` | identical |
+
+Regression-tested in `OrderedJsonInputSpec` with raw request bodies — note that the test *must*
+build its body as bytes, because the `yaml` quoter and `J.encode` both sort object keys and a test
+assembled through either would have passed no matter what the engine did.

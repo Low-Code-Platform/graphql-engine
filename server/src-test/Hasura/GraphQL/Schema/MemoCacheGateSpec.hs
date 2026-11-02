@@ -189,7 +189,8 @@ runBuildSdl mStore sourceInfo = do
           removeEmptySubscriptionResponses = Options.PreserveEmptyResponses,
           remoteNullForwardingPolicy = Options.RemoteForwardAccurately,
           optimizePermissionFilters = Options.Don'tOptimizePermissionFilters,
-          bigqueryStringNumericInput = Options.EnableBigQueryStringNumericInput
+          bigqueryStringNumericInput = Options.EnableBigQueryStringNumericInput,
+          orderedJsonInput = Options.PreserveJsonInputOrder
         }
 
 --------------------------------------------------------------------------------

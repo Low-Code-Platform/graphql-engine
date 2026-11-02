@@ -4,6 +4,7 @@
 -- JSON 'Value'.
 module Hasura.Backends.Postgres.SQL.Value
   ( PGScalarValue (..),
+    pgValJSONRawFromOrdered,
     pgScalarValueToJson,
     withConstructorFn,
     parsePGValue,
@@ -37,6 +38,8 @@ import Database.PG.Query.PTI qualified as PTI
 import Database.PostgreSQL.LibPQ qualified as PQ
 import Hasura.Backends.Postgres.SQL.DML qualified as S
 import Hasura.Backends.Postgres.SQL.Types
+import Data.Aeson.Ordered qualified as JO
+import Hasura.EncJSON (encJFromOrderedValue, encJToBS)
 import Hasura.Prelude
 import Hasura.SQL.GeoJSON
 import Hasura.SQL.Time
@@ -114,6 +117,14 @@ data PGScalarValue
   | PGValUnknown Text
   | PGValArray [PGScalarValue]
   deriving (Show, Eq)
+
+-- | Build a 'PGValJSONRaw' from an insertion-ordered value, keeping its key order.
+--
+-- Deliberately not @encode . JO.fromOrdered@: converting to an aeson 'Value'
+-- first would put the keys back through a @KeyMap@ and sort them, undoing the
+-- only thing this exists to achieve.
+pgValJSONRawFromOrdered :: JO.Value -> PGScalarValue
+pgValJSONRawFromOrdered = PGValJSONRaw . bsToTxt . encJToBS . encJFromOrderedValue
 
 pgScalarValueToJson :: PGScalarValue -> Value
 pgScalarValueToJson = \case
