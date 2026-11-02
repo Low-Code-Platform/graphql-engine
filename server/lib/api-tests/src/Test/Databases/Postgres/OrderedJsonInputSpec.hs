@@ -236,6 +236,30 @@ rqlInsertTests = describe "RQL query API (type: insert)" do
             - '{}'
       |]
 
+  it "preserves key order at every level of a nested document" \testEnvironment -> do
+    -- Nested matters separately here: the RQL path substitutes the ordered value
+    -- per column, so a column holding a whole subtree exercises different code
+    -- from the flat case above.
+    _ <-
+      rqlInsertRaw
+        testEnvironment
+        ( "[{\"id\": 43, \"docb\": {}, \"doc\": "
+            <> "{\"zebra\":1,\"nested\":{\"yankee\":{\"x-ray\":1,\"alpha\":2}},"
+            <> "\"list\":[{\"zulu\":1,\"alpha\":2}],\"apple\":2}}]"
+        )
+
+    shouldReturnYaml
+      testEnvironment
+      (storedText testEnvironment 43)
+      [yaml|
+        result_type: TuplesOk
+        result:
+          - - doc
+            - docb
+          - - '{"zebra":1,"nested":{"yankee":{"x-ray":1,"alpha":2}},"list":[{"zulu":1,"alpha":2}],"apple":2}'
+            - '{}'
+      |]
+
   it "keeps each row's own order when one insert carries several" \testEnvironment -> do
     -- Two rows differing only in key order must not collapse onto one value.
     _ <-
