@@ -129,7 +129,10 @@ memoize name f a = memoizeOn name a (f a)
 newtype MemoizeT m a = MemoizeT
   { unMemoizeT :: StateT (DMap MemoizationKey Identity) m a
   }
-  deriving (Functor, Applicative, Monad, MonadError e, MonadReader r, MonadTrans)
+  -- MonadIO is exposed for the Phase 9 per-table field cache, which must consult a
+  -- store from inside the schema builders. The capability is already required here:
+  -- see Note [MemoizeT requires MonadIO].
+  deriving (Functor, Applicative, Monad, MonadError e, MonadReader r, MonadTrans, MonadIO)
 
 -- | Allow code in 'MemoizeT' to have access to any underlying state capabilities,
 -- hiding the fact that 'MemoizeT' itself is a state monad.

@@ -138,6 +138,7 @@ buildTableInfo TableInfoBuilder {..} = tableInfo
     tableCoreInfo =
       TableCoreInfo
         { _tciName = table,
+          _tciOid = OID 1,
           _tciDescription = Nothing,
           _tciFieldInfoMap = fieldInfoMap,
           _tciPrimaryKey = pk,

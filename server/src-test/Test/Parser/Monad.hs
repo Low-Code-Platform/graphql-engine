@@ -6,6 +6,7 @@ module Test.Parser.Monad
   ( ParserTest (..),
     SchemaEnvironment (..),
     SchemaTest,
+    defaultSchemaOptions,
     runSchemaTest,
     notImplementedYet,
   )
@@ -74,7 +75,8 @@ defaultSchemaOptions =
       soIncludeGroupByAggregateFields = Options.IncludeGroupByAggregateFields,
       soPostgresArrays = Options.UsePostgresArrays,
       soNoNullUnboundVariableDefault = Options.DefaultUnboundNullableVariablesToNull,
-      soRemoveEmptySubscriptionResponses = Options.PreserveEmptyResponses
+      soRemoveEmptySubscriptionResponses = Options.PreserveEmptyResponses,
+      soOrderedJsonInput = Options.SortJsonInputKeys
     }
 
 instance Has NamingCase SchemaEnvironment where

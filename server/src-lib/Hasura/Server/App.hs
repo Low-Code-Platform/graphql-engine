@@ -18,6 +18,7 @@ module Hasura.Server.App
     configApiGetHandler,
     isAdminSecretSet,
     mkGetHandler,
+    mkPostHandlerWithOrderedJson,
     mkSpockAction,
     mkWaiApp,
     onlyAdmin,
@@ -36,8 +37,7 @@ import Control.Monad.Trans.Control (MonadBaseControl)
 import Data.Aeson
 import Data.Aeson qualified as J
 import Data.Aeson.Encoding qualified as J
-import Data.Aeson.Key qualified as K
-import Data.Aeson.KeyMap qualified as KM
+import Data.Aeson.Ordered qualified as JO
 import Data.Aeson.Types qualified as J
 import Data.ByteString.Builder qualified as BB
 import Data.ByteString.Char8 qualified as B8
@@ -192,6 +192,15 @@ data APIHandler m a where
   AHGet :: !(Handler m (HttpLogGraphQLInfo, APIResp)) -> APIHandler m void
   -- | A simple POST request that expects a request body from which an 'a' can be extracted
   AHPost :: !(a -> Handler m (HttpLogGraphQLInfo, APIResp)) -> APIHandler m a
+  -- | As 'AHPost', but the body is additionally parsed with the
+  -- order-preserving decoder and the given function folds the ordered value
+  -- back into the decoded request. Used by the RQL query endpoints so that key
+  -- order inside an insert's @objects@ survives; see
+  -- 'Hasura.RQL.DML.Types.withOrderedInsertObjects'.
+  AHPostWithOrderedJson ::
+    !(JO.Value -> a -> a) ->
+    !(a -> Handler m (HttpLogGraphQLInfo, APIResp)) ->
+    APIHandler m a
   -- | A general GraphQL request (query or mutation) for which the content of the query
   -- is made available to the handler for authentication.
   -- This is a more specific version of the 'AHPost' constructor.
@@ -210,6 +219,12 @@ mkGetHandler = AHGet
 
 mkPostHandler :: (a -> Handler m (HttpLogGraphQLInfo, APIResp)) -> APIHandler m a
 mkPostHandler = AHPost
+
+mkPostHandlerWithOrderedJson ::
+  (JO.Value -> a -> a) ->
+  (a -> Handler m (HttpLogGraphQLInfo, APIResp)) ->
+  APIHandler m a
+mkPostHandlerWithOrderedJson = AHPostWithOrderedJson
 
 mkGQLRequestHandler :: (GH.ReqsText -> Handler m (HttpLogGraphQLInfo, APIResp)) -> APIHandler m GH.ReqsText
 mkGQLRequestHandler = AHGraphQLRequest
@@ -247,6 +262,40 @@ parseBody reqBody =
   case eitherDecode' reqBody of
     Left e -> throw400 InvalidJSON (T.pack e)
     Right jVal -> (jVal,) <$> decodeValue jVal
+
+-- | As 'parseBody', but keeps the key order of GraphQL variable values.
+--
+-- This is the default path, so it parses the body /once/, with the
+-- order-preserving decoder, and derives the aeson 'Value' the rest of the
+-- pipeline wants via 'JO.fromOrdered'. An earlier version left 'parseBody'
+-- alone and parsed a second time to recover the order, which was the right
+-- trade while the behaviour was opt-in — nobody who had not asked for it paid
+-- anything — but it would put a second full parse of every request body on the
+-- hot path now that it is on by default.
+--
+-- Structural decoding and all of its error messages are therefore unchanged:
+-- 'decodeValue' still runs, on an aeson 'Value' identical to the one aeson's own
+-- parser would have produced. The one difference is the message for a body that
+-- is not valid JSON at all, which now comes from the ordered decoder.
+--
+-- When 'EFDisableOrderedJsonInput' is set this falls back to 'parseBody'
+-- verbatim, so the escape hatch is a true revert to the previous behaviour
+-- rather than an approximation of it.
+parseBodyWithOrderedVariables ::
+  (FromJSON a, MonadError QErr m) =>
+  S.HashSet ExperimentalFeature ->
+  (JO.Value -> a -> a) ->
+  BL.ByteString ->
+  m (Value, a)
+parseBodyWithOrderedVariables expFeatures restoreOrder reqBody
+  | EFDisableOrderedJsonInput `S.member` expFeatures = parseBody reqBody
+  | otherwise =
+      case JO.eitherDecode reqBody of
+        Left e -> throw400 InvalidJSON (T.pack e)
+        Right joVal -> do
+          let jVal = JO.fromOrdered joVal
+          parsed <- decodeValue jVal
+          pure (jVal, restoreOrder joVal parsed)
 
 onlyAdmin :: (MonadError QErr m, MonadReader HandlerCtx m) => m ()
 onlyAdmin = do
@@ -378,10 +427,17 @@ mkSpockAction appStateRef qErrEncoder qErrModifier apiHandler = do
             `onLeft` logErrorAndResp (Just userInfo) requestId req (reqBody, Nothing) includeInternal Nothing origHeaders extraUserInfo
         res <- lift $ runHandler (_lsLogger appEnvLoggers) handlerState $ handler parsedReq
         pure (res, userInfo, authHeaders, includeInternal, Just queryJSON, extraUserInfo)
+      AHPostWithOrderedJson restoreOrder handler -> do
+        (userInfo, authHeaders, handlerState, includeInternal, extraUserInfo) <- getInfo Nothing
+        (queryJSON, parsedReq) <-
+          runExcept (parseBodyWithOrderedVariables acExperimentalFeatures restoreOrder reqBody)
+            `onLeft` logErrorAndResp (Just userInfo) requestId req (reqBody, Nothing) includeInternal Nothing origHeaders extraUserInfo
+        res <- lift $ runHandler (_lsLogger appEnvLoggers) handlerState $ handler parsedReq
+        pure (res, userInfo, authHeaders, includeInternal, Just queryJSON, extraUserInfo)
       -- in this case we parse the request _first_ and then send the request to the webhook for auth
       AHGraphQLRequest handler -> do
         (queryJSON, parsedReq) <-
-          runExcept (parseBody reqBody) `onLeft` \e -> do
+          runExcept (parseBodyWithOrderedVariables acExperimentalFeatures GH.withOrderedVariablesInReqs reqBody) `onLeft` \e -> do
             -- if the request fails to parse, call the webhook without a request body
             -- TODO should we signal this to the webhook somehow?
             (userInfo, _, _, _, extraUserInfo) <- getInfo Nothing
@@ -392,7 +448,7 @@ mkSpockAction appStateRef qErrEncoder qErrModifier apiHandler = do
         pure (res, userInfo, authHeaders, includeInternal, Just queryJSON, extraUserInfo)
       AHPersistedGraphQLRequest handler -> do
         (queryJSON, parsedReq) <-
-          runExcept (parseBody reqBody) `onLeft` \e -> do
+          runExcept (parseBodyWithOrderedVariables acExperimentalFeatures withOrderedVariablesInExtReqs reqBody) `onLeft` \e -> do
             -- if the request fails to parse, call the webhook without a request body
             -- TODO should we signal this to the webhook somehow?
             (userInfo, _, _, _, extraUserInfo) <- getInfo Nothing
@@ -600,7 +656,7 @@ v1Alpha1GQHandler queryType query = do
   reqHeaders <- asks hcReqHeaders
   ipAddress <- asks hcSourceIpAddress
   requestId <- asks hcRequestId
-  GH.runGQBatched acEnvironment acSQLGenCtx schemaCache acEnableAllowlist appEnvEnableReadOnlyMode appEnvPrometheusMetrics (_lsLogger appEnvLoggers) appEnvLicenseKeyCache requestId acResponseInternalErrorsConfig acRemoteSchemaResponsePriority acHeaderPrecedence acTraceQueryStatus userInfo ipAddress reqHeaders queryType query
+  GH.runGQBatched acEnvironment acSQLGenCtx schemaCache acEnableAllowlist appEnvEnableReadOnlyMode appEnvPrometheusMetrics (_lsLogger appEnvLoggers) appEnvLicenseKeyCache requestId acResponseInternalErrorsConfig acRemoteSchemaResponsePriority acHeaderPrecedence acTraceQueryStatus userInfo ipAddress reqHeaders queryType query (acDefaultSource, acDefaultSchema)
 
 v1GQHandler ::
   ( MonadIO m,
@@ -663,7 +719,9 @@ gqlExplainHandler query = do
   responseErrorsConfig <- asks (acResponseInternalErrorsConfig . hcAppContext)
   licenseKeyCache <- asks hcLicenseKeyCache
   SQLGenCtx {nullInNonNullableVariables, noNullUnboundVariableDefault, removeEmptySubscriptionResponses} <- asks (acSQLGenCtx . hcAppContext)
-  res <- GE.explainGQLQuery removeEmptySubscriptionResponses nullInNonNullableVariables noNullUnboundVariableDefault (lastBuiltSchemaCache schemaCache) licenseKeyCache reqHeaders query responseErrorsConfig
+  appCtx <- asks hcAppContext
+  let defaultGqlSchema = (acDefaultSource appCtx, acDefaultSchema appCtx)
+  res <- GE.explainGQLQuery removeEmptySubscriptionResponses nullInNonNullableVariables noNullUnboundVariableDefault (lastBuiltSchemaCache schemaCache) licenseKeyCache reqHeaders query responseErrorsConfig defaultGqlSchema
   return $ HttpResponse res []
 
 v1Alpha1PGDumpHandler :: (MonadIO m, MonadError QErr m, MonadReader HandlerCtx m) => PGD.PGDumpReqBody -> m APIResp
@@ -994,7 +1052,7 @@ httpApp setupHook appStateRef AppEnv {..} consoleType ekgStore closeWebsocketsOn
               Spock.PATCH -> pure EP.PATCH
               other -> throw400 BadRequest $ "Method " <> tshow other <> " not supported."
             _ -> throw400 BadRequest $ "Nonstandard method not allowed for REST endpoints"
-        fmap JSONResp <$> runCustomEndpoint acEnvironment acSQLGenCtx schemaCache acEnableAllowlist appEnvEnableReadOnlyMode acRemoteSchemaResponsePriority acHeaderPrecedence acTraceQueryStatus appEnvPrometheusMetrics (_lsLogger appEnvLoggers) appEnvLicenseKeyCache requestId userInfo reqHeaders ipAddress req endpoints responseErrorsConfig
+        fmap JSONResp <$> runCustomEndpoint acEnvironment acSQLGenCtx schemaCache acEnableAllowlist appEnvEnableReadOnlyMode acRemoteSchemaResponsePriority acHeaderPrecedence acTraceQueryStatus appEnvPrometheusMetrics (_lsLogger appEnvLoggers) appEnvLicenseKeyCache requestId userInfo reqHeaders ipAddress req endpoints responseErrorsConfig (acDefaultSource, acDefaultSchema)
 
   -- See Issue #291 for discussion around restified feature
   Spock.hookRouteAll ("api" <//> "rest" <//> Spock.wildcard) $ \wildcard -> do
@@ -1005,8 +1063,12 @@ httpApp setupHook appStateRef AppEnv {..} consoleType ekgStore closeWebsocketsOn
     -- This is where we decode the json encoded body args. They
     -- are treated as if they came from query arguments, but allow
     -- us to pass non-scalar values.
-    let bodyParams = case J.decodeStrict body of
-          Just (J.Object o) -> map (first K.toText) $ KM.toList o
+    -- Decoded with the order-preserving parser rather than aeson so that a
+    -- JSON object passed to a REST endpoint keeps its key order; see
+    -- 'EFDisableOrderedJsonInput'. This replaces the aeson parse rather than adding
+    -- one, so it costs nothing when the feature is off.
+    let bodyParams = case JO.decode body of
+          Just (JO.Object o) -> JO.toList o
           _ -> []
         allParams = fmap Left <$> queryParams <|> fmap Right <$> bodyParams
 
@@ -1028,7 +1090,7 @@ httpApp setupHook appStateRef AppEnv {..} consoleType ekgStore closeWebsocketsOn
     onlyWhenApiEnabled isMetadataEnabled appStateRef
       $ mkSpockAction appStateRef encodeQErr id
       $ do
-        mkPostHandler $ fmap (emptyHttpLogGraphQLInfo,) <$> mkAPIRespHandler (v1QueryHandler schemaCacheUpdater)
+        mkPostHandlerWithOrderedJson withOrderedRQLInsertObjects $ fmap (emptyHttpLogGraphQLInfo,) <$> mkAPIRespHandler (v1QueryHandler schemaCacheUpdater)
 
   Spock.post "v1/metadata" $ do
     onlyWhenApiEnabled isMetadataEnabled appStateRef
@@ -1040,7 +1102,7 @@ httpApp setupHook appStateRef AppEnv {..} consoleType ekgStore closeWebsocketsOn
   Spock.post "v2/query" $ do
     onlyWhenApiEnabled isMetadataEnabled appStateRef
       $ mkSpockAction appStateRef encodeQErr id
-      $ mkPostHandler
+      $ mkPostHandlerWithOrderedJson V2Q.withOrderedRQLInsertObjects
       $ fmap (emptyHttpLogGraphQLInfo,)
       <$> mkAPIRespHandler (v2QueryHandler schemaCacheUpdater)
 

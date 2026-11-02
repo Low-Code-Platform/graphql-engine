@@ -22,7 +22,7 @@ import Database.PostgreSQL.LibPQ qualified as PQ
 import Hasura.Backends.Postgres.DDL qualified as Postgres
 import Hasura.Backends.Postgres.Execute.Types (PGExecCtxInfo (..), PGExecFrom (..), PGExecTxType (..), runPgSourceReadTx, _pecRunTx, _pscExecCtx)
 import Hasura.Backends.Postgres.Instances.NativeQueries as Postgres (validateNativeQuery)
-import Hasura.Backends.Postgres.SQL.Types (QualifiedObject (..), QualifiedTable)
+import Hasura.Backends.Postgres.SQL.Types (QualifiedObject (..), QualifiedTable, qSchema)
 import Hasura.Backends.Postgres.SQL.Types qualified as Postgres
 import Hasura.Backends.Postgres.Types.CitusExtraTableMetadata
 import Hasura.Base.Error
@@ -292,6 +292,8 @@ instance
   buildComputedFieldBooleanExp = Postgres.buildComputedFieldBooleanExp
   validateNativeQuery = Postgres.validateNativeQuery (pgTypeOidMapping @pgKind)
   supportsBeingRemoteRelationshipTarget _ = True
+  tableNameSchema = qSchema
+  functionNameSchema = qSchema
 
   getTableInfo sourceName tableName = do
     sourceConfig <- askSourceConfig @('Postgres pgKind) sourceName

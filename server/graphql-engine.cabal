@@ -838,6 +838,7 @@ library
                      , Hasura.RQL.Types.Metadata.Backend
                      , Hasura.RQL.Types.Metadata.Common
                      , Hasura.RQL.Types.Metadata.Instances
+                     , Hasura.RQL.Types.Metadata.Partition
                      , Hasura.RQL.Types.Metadata.Object
                      , Hasura.RQL.Types.Metadata.Serialization
                      , Hasura.RQL.Types.NamingCase
@@ -915,6 +916,7 @@ library
                      , Hasura.RQL.DDL.Schema.Cache.Config
                      , Hasura.RQL.DDL.Schema.Cache.Dependencies
                      , Hasura.RQL.DDL.Schema.Cache.Fields
+                     , Hasura.RQL.DDL.Schema.Cache.PartialRebuild
                      , Hasura.RQL.DDL.Schema.Cache.Permission
                      , Hasura.RQL.DDL.Schema.Catalog
                      , Hasura.RQL.DDL.Schema.Diff
@@ -1001,6 +1003,8 @@ library
                      , Hasura.GraphQL.Schema.Common
                      , Hasura.GraphQL.Schema.Instances
                      , Hasura.GraphQL.Schema.Introspect
+                     , Hasura.GraphQL.Schema.TableDeps
+                     , Hasura.GraphQL.Schema.TableFieldCache
                      , Hasura.GraphQL.Schema.Mutation
                      , Hasura.GraphQL.Schema.NamingCase
                      , Hasura.GraphQL.Schema.Node
@@ -1234,9 +1238,13 @@ test-suite graphql-engine-tests
     Hasura.GraphQL.Schema.BoolExp.AggregationPredicatesSpec
     Hasura.GraphQL.Schema.Build.UpdateSpec
     Hasura.GraphQL.Schema.Introspection
+    Hasura.GraphQL.Schema.MemoCacheGateSpec
     Hasura.GraphQL.Schema.RemoteSpec
+    Hasura.GraphQL.Schema.TableDepsSpec
+    Hasura.GraphQL.Schema.TableFieldCacheSpec
     Hasura.Metadata.DTO.MetadataDTOSpec
     Hasura.QuickCheck.Instances
+    Hasura.RQL.DDL.Schema.Cache.PartialRebuildSpec
     Hasura.RQL.DDL.Webhook.TransformSpec
     Hasura.RQL.IR.Generator
     Hasura.RQL.IR.SelectSpec
@@ -1312,3 +1320,21 @@ test-suite graphql-engine-test-postgres
     Test.Hasura.EventTriggerCleanupSuite
     Test.Hasura.StreamingSubscriptionSuite
     Test.Hasura.Server.MigrateSuite
+
+benchmark schema-cache-bench
+  type:             exitcode-stdio-1.0
+  hs-source-dirs:   bench
+  main-is:          SchemaCacheRebench.hs
+  default-language: Haskell2010
+  default-extensions:
+    ImportQualifiedPost
+    OverloadedStrings
+    RecordWildCards
+  ghc-options:      -Wall -O2 -threaded -rtsopts "-with-rtsopts=-N"
+  build-depends:
+      base        >= 4.14
+    , aeson
+    , bytestring
+    , http-client >= 0.7
+    , http-types
+    , tasty-bench >= 0.3

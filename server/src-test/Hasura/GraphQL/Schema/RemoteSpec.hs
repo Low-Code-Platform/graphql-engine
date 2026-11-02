@@ -8,8 +8,8 @@ module Hasura.GraphQL.Schema.RemoteSpec (spec) where
 import Control.Lens (Prism', prism', to, (^..), _Right)
 import Control.Monad.Memoize
 import Data.Aeson qualified as J
-import Data.Aeson.Key qualified as K
 import Data.Aeson.KeyMap qualified as KM
+import Data.Aeson.Ordered qualified as JO
 import Data.ByteString.Lazy qualified as LBS
 import Data.CaseInsensitive qualified as CI
 import Data.HashMap.Strict.Extended qualified as HashMap
@@ -117,14 +117,16 @@ mkTestExecutableDocument t = runIdentity
           pure (G._todVariableDefinitions opDef, resSelSet)
       _ -> throw500 "must have only one query in the document"
 
-mkTestVariableValues :: LBS.ByteString -> HashMap.HashMap G.Name J.Value
+-- | Decoded with the order-preserving parser, matching what the HTTP layer now
+-- hands to 'resolveVariables'.
+mkTestVariableValues :: LBS.ByteString -> HashMap.HashMap G.Name JO.Value
 mkTestVariableValues vars = runIdentity
   $ runError
   $ do
-    value <- J.eitherDecode vars `onLeft` (throw500 . T.pack)
+    value <- JO.eitherDecode vars `onLeft` (throw500 . T.pack)
     case value of
-      J.Object vs ->
-        HashMap.fromList <$> for (KM.toList vs) \(K.toText -> name, val) -> do
+      JO.Object vs ->
+        HashMap.fromList <$> for (JO.toList vs) \(name, val) -> do
           gname <- G.mkName name `onNothing` throw500 ("wrong Name: " <>> name)
           pure (gname, val)
       _ -> throw500 "variables must be an object"
@@ -160,7 +162,7 @@ buildQueryParsers introspection customizer = do
 runQueryParser ::
   P.FieldParser TestMonad any ->
   ([G.VariableDefinition], G.SelectionSet G.NoFragments G.Name) ->
-  HashMap.HashMap G.Name J.Value ->
+  HashMap.HashMap G.Name JO.Value ->
   any
 runQueryParser parser (varDefs, selSet) vars = runIdentity . runError $ do
   (_, resolvedSelSet) <- resolveVariables Options.Don'tAllowNullInNonNullableVariables Options.DefaultUnboundNullableVariablesToNull varDefs vars [] selSet
@@ -263,7 +265,7 @@ query($a: A!) {
                    $ Variable
                      (VIRequired _a)
                      (G.TypeNamed (G.Nullability False) _A)
-                     (Just $ JSONValue $ J.Object $ KM.fromList [("b", J.Object $ KM.fromList [("c", J.Object $ KM.fromList [("i", J.Number 0)])])])
+                     (Just $ JSONValue $ JO.toOrdered $ J.Object $ KM.fromList [("b", J.Object $ KM.fromList [("c", J.Object $ KM.fromList [("i", J.Number 0)])])])
                )
 
 testNoVarExpansionIfNoPresetUnlessTopLevelOptionalField :: Spec

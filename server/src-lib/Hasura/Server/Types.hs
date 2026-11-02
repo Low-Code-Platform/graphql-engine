@@ -30,6 +30,7 @@ module Hasura.Server.Types
     PersistedQueryRequest (..),
     ExtPersistedQueryRequest (..),
     ExtQueryReqs (..),
+    withOrderedVariablesInExtReqs,
     MonadGetPolicies (..),
     RemoteSchemaResponsePriority (..),
     HeaderPrecedence (..),
@@ -41,6 +42,7 @@ import Control.Lens qualified as Lens
 import Data.Aeson
 import Data.Aeson.Casing qualified as J
 import Data.Aeson.Lens
+import Data.Aeson.Ordered qualified as JO
 import Data.Aeson.TH qualified as J
 import Data.Text (intercalate, unpack)
 import Database.PG.Query qualified as PG
@@ -110,6 +112,54 @@ data ExperimentalFeature
   | EFDisablePostgresArrays
   | EFNoNullUnboundVariableDefault
   | EFRemoveEmptySubscriptionResponses
+  | -- | Build the (global, O(total)) Relay GraphQL schema served at
+    -- @/v1beta1/relay@. Relay's @Node@ interface spans every source/schema and
+    -- cannot be cached per-(source, schema) like the Hasura schema, so it is
+    -- rebuilt in full on every metadata change — dominating mutation latency on
+    -- large metadata. It is therefore **disabled by default**; deployments that
+    -- actually use the @/v1beta1/relay@ endpoint must opt in with this feature.
+    -- See @rfcs/per-schema-gql-context.md@ §12.11–§12.13.
+    EFEnableRelaySchema
+  | -- | Turn OFF the per-table GraphQL schema cache.
+    --
+    -- The cache is ON by default. It reuses an unchanged table's field parsers
+    -- across schema-cache builds, so a mutation scoped to one table no longer
+    -- rebuilds every table in that DB schema. Measured on a 600-table schema:
+    -- track/untrack drop from ~1.4s to ~0.46s.
+    --
+    -- This is an escape hatch. The cache reuses a table's parsers unless the
+    -- table changed or it embeds one that did (see
+    -- "Hasura.GraphQL.Schema.TableDeps"); if that dependency analysis were ever
+    -- to under-reach, the served schema would be stale with no other symptom.
+    -- Setting this restores the unconditional rebuild.
+    --
+    -- See @rfcs/phase9-per-table-field-cache.md@.
+    EFDisablePerTableSchemaCache
+  | -- | Turn OFF preservation of the client's JSON object key order when
+    -- writing to a Postgres @json@ column, restoring the alphabetical sorting
+    -- the engine used to apply.
+    --
+    -- Order preservation is ON by default. A @json@ column stores its document
+    -- verbatim, so the key order a client sends is observable afterwards, and
+    -- sorting it was the engine imposing itself on data it was asked to store
+    -- as-is.
+    --
+    -- Only @json@ columns are affected either way. @jsonb@ decomposes into a
+    -- binary form that re-sorts keys (by length, then bytewise) and drops
+    -- duplicates, so nothing upstream of a @jsonb@ column can preserve order.
+    --
+    -- The order is faithful for values supplied as GraphQL /variables/. Inline
+    -- object literals are unaffected: they lose their order earlier, in the
+    -- GraphQL parser's AST, and are always stored alphabetically.
+    --
+    -- This is an escape hatch, for a deployment that depends on the old
+    -- alphabetical bytes — a checksum or ETag computed over the stored text,
+    -- say, or a test asserting the sorted form. Setting it also reverts the
+    -- request-body decode to aeson's, so it is a true revert rather than an
+    -- approximation.
+    --
+    -- See @rfcs/ordered-json-input.md@.
+    EFDisableOrderedJsonInput
   deriving (Bounded, Enum, Eq, Generic, Show)
 
 experimentalFeatureKey :: ExperimentalFeature -> Text
@@ -127,6 +177,9 @@ experimentalFeatureKey = \case
   EFDisablePostgresArrays -> "disable_postgres_arrays"
   EFNoNullUnboundVariableDefault -> "no_null_unbound_variable_default"
   EFRemoveEmptySubscriptionResponses -> "remove_empty_subscription_responses"
+  EFEnableRelaySchema -> "enable_relay_schema"
+  EFDisablePerTableSchemaCache -> "disable_per_table_schema_cache"
+  EFDisableOrderedJsonInput -> "disable_ordered_json_input"
 
 instance Hashable ExperimentalFeature
 
@@ -340,6 +393,17 @@ instance FromJSON ExtQueryReqs where
     -- The APQ requests, have a special object in the key `Extentions` called as `persistedQuery`
     | isJust (json Lens.^? key "extensions" . key "persistedQuery") = EqrAPQReq <$> parseJSON json
     | otherwise = EqrGQLReq <$> (GH.GQLSingleRequest <$> parseJSON json)
+
+-- | Restore variable-value key order in a POST body that may be either a normal
+-- GraphQL request or a persisted-query request. See
+-- 'GH.withOrderedVariables'.
+withOrderedVariablesInExtReqs :: JO.Value -> ExtQueryReqs -> ExtQueryReqs
+withOrderedVariablesInExtReqs bodyVal = \case
+  EqrGQLReq reqs -> EqrGQLReq $ GH.withOrderedVariablesInReqs bodyVal reqs
+  -- A persisted query carries its variables at the top level of the body rather
+  -- than inside a 'GH.GQLReq', but they come from the same place.
+  EqrAPQReq apq ->
+    EqrAPQReq apq {_extVariables = GH.restoreVariableOrder bodyVal <$> _extVariables apq}
 
 class (Monad m) => MonadGetPolicies m where
   runGetApiTimeLimit ::

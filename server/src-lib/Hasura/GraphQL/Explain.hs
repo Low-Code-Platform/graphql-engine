@@ -11,6 +11,7 @@ import Hasura.Authentication.Role (adminRoleName)
 import Hasura.Authentication.Session (SessionVariables)
 import Hasura.Authentication.User (UserAdminSecret (..), UserInfo, UserRoleBuild (..), mkUserInfo)
 import Hasura.Backends.DataConnector.Agent.Client (AgentLicenseKey)
+import Hasura.Backends.Postgres.SQL.Types (SchemaName)
 import Hasura.Base.Error
 import Hasura.CredentialCache
 import Hasura.EncJSON
@@ -32,6 +33,7 @@ import Hasura.Metadata.Class
 import Hasura.Prelude
 import Hasura.QueryTags
 import Hasura.RQL.IR
+import Hasura.RQL.Types.Common (SourceName)
 import Hasura.RQL.Types.Schema.Options qualified as Options
 import Hasura.RQL.Types.SchemaCache
 import Hasura.SQL.AnyBackend qualified as AB
@@ -103,8 +105,10 @@ explainGQLQuery ::
   [HTTP.Header] ->
   GQLExplain ->
   ResponseInternalErrorsConfig ->
+  -- | Configured @(default source, default schema)@ from the serve options.
+  (Maybe SourceName, Maybe SchemaName) ->
   m EncJSON
-explainGQLQuery removeEmptySubscriptionResponses nullInNonNullableVariables noNullUnboundVariableDefault sc agentLicenseKey reqHeaders (GQLExplain query sessionVariables maybeIsRelay) responseErrorsConfig = do
+explainGQLQuery removeEmptySubscriptionResponses nullInNonNullableVariables noNullUnboundVariableDefault sc agentLicenseKey reqHeaders (GQLExplain query sessionVariables maybeIsRelay) responseErrorsConfig defaultGqlSchema = do
   -- NOTE!: we will be executing what follows as though admin role. See e.g. notes in explainField:
   userInfo <-
     mkUserInfo
@@ -112,8 +116,11 @@ explainGQLQuery removeEmptySubscriptionResponses nullInNonNullableVariables noNu
       UAdminSecretSent
       (fromMaybe mempty sessionVariables)
   -- we don't need to check in allow list as we consider it an admin endpoint
-  let graphQLContext = E.makeGQLContext userInfo sc queryType
   queryParts <- GH.getSingleOperation query
+  targetPair <- E.resolveTargetSchema defaultGqlSchema sc reqHeaders queryParts
+  graphQLContext <-
+    E.makeGQLContext userInfo sc queryType targetPair
+      `onNothing` throw400 NotFound "no GraphQL schema for the requested source/schema"
   case queryParts of
     G.TypedOperationDefinition G.OperationTypeQuery _ varDefs directives inlinedSelSet -> do
       (unpreparedQueries, _, _) <-

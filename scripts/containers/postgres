@@ -60,16 +60,21 @@ CONF_FLAGS=(
 
 function pg_launch_container {
   echo_pretty "Launching postgres container: $PG_CONTAINER_NAME"
-  docker volume create "$PG_VOLUME_NAME"
-  docker run \
-    --name "$PG_CONTAINER_NAME" \
-    --publish "127.0.0.1:${PG_PORT}:${PG_PORT}" \
-    --expose="$PG_PORT" \
-    --volume="${PG_VOLUME_NAME}:/var/lib/postgresql" \
-    --env=POSTGRES_PASSWORD="$PG_PASSWORD" \
-    --detach \
-    "$PG_CONTAINER_IMAGE" \
-    "${CONF_FLAGS[@]}"
+  if docker ps -a --format '{{.Names}}' | grep -q "^${PG_CONTAINER_NAME}$"; then
+    echo_pretty "Container $PG_CONTAINER_NAME already exists, starting it"
+    docker start "$PG_CONTAINER_NAME"
+  else
+    docker volume create "$PG_VOLUME_NAME"
+    docker run \
+      --name "$PG_CONTAINER_NAME" \
+      --publish "127.0.0.1:${PG_PORT}:${PG_PORT}" \
+      --expose="$PG_PORT" \
+      --volume="${PG_VOLUME_NAME}:/var/lib/postgresql" \
+      --env=POSTGRES_PASSWORD="$PG_PASSWORD" \
+      --detach \
+      "$PG_CONTAINER_IMAGE" \
+      "${CONF_FLAGS[@]}"
+  fi
 
   # graphql-engine calls the pg_dump executable. To avoid a version mismatch (and
   # the dependency entirely) we create a shim that executes the pg_dump in the

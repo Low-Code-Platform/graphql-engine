@@ -66,6 +66,7 @@ module Hasura.GraphQL.ParameterizedQueryHash
 where
 
 import Data.Aeson qualified as J
+import Data.Aeson.Ordered qualified as JO
 import Data.Aeson.Key qualified as K
 import Data.Aeson.KeyMap qualified as KM
 import Data.ByteString qualified as B
@@ -184,7 +185,7 @@ normalizeSelectionSet = (normalizeSelection =<<)
       G.VVariable (Variable _info _type (Just value)) ->
         case value of
           GraphQLValue val -> normalizeConstValue val
-          JSONValue v -> jsonToNormalizedGQLVal v
+          JSONValue v -> jsonToNormalizedGQLVal (JO.fromOrdered v)
 
 calculateParameterizedQueryHash :: G.SelectionSet G.NoFragments Variable -> ParameterizedQueryHash
 calculateParameterizedQueryHash = ParameterizedQueryHash . cryptoHash . Text.run . G.selectionSet . normalizeSelectionSet

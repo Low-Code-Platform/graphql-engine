@@ -8,6 +8,8 @@ module Hasura.Backends.MSSQL.Instances.Metadata () where
 
 import Hasura.Backends.MSSQL.DDL qualified as MSSQL
 import Hasura.Backends.MSSQL.Schema.Introspection qualified as MSSQL (listAllTables)
+import Hasura.Backends.MSSQL.Types.Internal qualified as MSSQLTypes
+import Hasura.Backends.Postgres.SQL.Types qualified as PG
 import Hasura.Base.Error (Code (UnexpectedPayload), throw400, throw500)
 import Hasura.NativeQuery.InterpolatedQuery (trimQueryEnd)
 import Hasura.NativeQuery.Metadata (NativeQueryMetadata (..))
@@ -42,3 +44,9 @@ instance BackendMetadata 'MSSQL where
     pure (trimQueryEnd (_nqmCode nq)) -- for now, all queries are valid
   validateStoredProcedure _ _ _ _ = pure () -- for now, all stored procedures are valid
   getStoredProcedureGraphqlName = MSSQL.getStoredProcedureGraphqlName
+  -- MSSQL is multi-schema (dbo, app, ...), so partition metadata/GraphQL contexts
+  -- by the object's real schema rather than the single-schema 'publicSchema'
+  -- default. The class method returns the Postgres 'SchemaName' newtype, so we
+  -- rewrap the MSSQL schema text into it.
+  tableNameSchema = PG.SchemaName . MSSQLTypes._unSchemaName . MSSQLTypes.tableSchema
+  functionNameSchema = PG.SchemaName . MSSQLTypes._unSchemaName . MSSQLTypes.functionSchema

@@ -5,7 +5,7 @@ module Hasura.GraphQL.Execute.Resolve
   )
 where
 
-import Data.Aeson qualified as J
+import Data.Aeson.Ordered qualified as JO
 import Data.HashMap.Strict.Extended qualified as HashMap
 import Data.HashSet qualified as HS
 import Data.List qualified as L
@@ -149,7 +149,7 @@ resolveVariables nullInNonNullableVariables noNullUnboundVariableDefault definit
             == Options.Don'tAllowNullInNonNullableVariables
             -- A 'null' value provided
             && jsonValue
-            == J.Null
+            == JO.Null
             then -- raise validation exception
 
               throw400 ValidationFailed

@@ -5,6 +5,7 @@ where
 
 import Control.Lens ((^?))
 import Control.Monad.Trans.Control (MonadBaseControl)
+import Data.Aeson.Ordered qualified as JO
 import Data.Aeson.Types
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet qualified as HS
@@ -28,6 +29,7 @@ import Hasura.RQL.IR.Insert
 import Hasura.RQL.Types.BackendType
 import Hasura.RQL.Types.Column
 import Hasura.RQL.Types.Common
+import Hasura.RQL.Types.Schema.Options qualified as Options
 import Hasura.RQL.Types.Metadata
 import Hasura.RQL.Types.SchemaCache
 import Hasura.Table.Cache
@@ -35,7 +37,7 @@ import Hasura.Tracing qualified as Tracing
 
 convObj ::
   (UserInfoM m, QErrM m) =>
-  (ColumnType ('Postgres 'Vanilla) -> Value -> m S.SQLExp) ->
+  (ColumnType ('Postgres 'Vanilla) -> JO.Value -> m S.SQLExp) ->
   HashMap.HashMap PGCol S.SQLExp ->
   HashMap.HashMap PGCol S.SQLExp ->
   FieldInfoMap (FieldInfo ('Postgres 'Vanilla)) ->
@@ -144,9 +146,9 @@ buildConflictClause sessVarBldr tableInfo inpCols (OnConflict mTCol mTCons act) 
 
 convInsertQuery ::
   (UserInfoM m, QErrM m, TableInfoRM ('Postgres 'Vanilla) m) =>
-  (Value -> m [InsObj ('Postgres 'Vanilla)]) ->
+  (JO.Value -> m [InsObj ('Postgres 'Vanilla)]) ->
   SessionVariableBuilder m ->
-  (ColumnType ('Postgres 'Vanilla) -> Value -> m S.SQLExp) ->
+  (ColumnType ('Postgres 'Vanilla) -> JO.Value -> m S.SQLExp) ->
   InsertQuery ->
   m (InsertQueryP1 ('Postgres 'Vanilla))
 convInsertQuery objsParser sessVarBldr prepFn (InsertQuery tableName _ val oC mRetCols) = do
@@ -231,9 +233,10 @@ convInsertQuery objsParser sessVarBldr prepFn (InsertQuery tableName _ val oC mR
 
 convInsQ ::
   (QErrM m, UserInfoM m, CacheRM m) =>
+  Options.OrderedJsonInput ->
   InsertQuery ->
   m (InsertQueryP1 ('Postgres 'Vanilla), DS.Seq PG.PrepArg)
-convInsQ query = do
+convInsQ orderedJsonInput query = do
   let source = iqSource query
   tableCache :: TableCache ('Postgres 'Vanilla) <- fold <$> askTableCache source
   flip runTableCacheRT tableCache
@@ -241,7 +244,7 @@ convInsQ query = do
     $ convInsertQuery
       (withPathK "objects" . decodeInsObjs)
       sessVarFromCurrentSetting
-      binRHSBuilder
+      (binRHSBuilderOrdered orderedJsonInput)
       query
 
 runInsert ::
@@ -260,14 +263,44 @@ runInsert ::
 runInsert sqlGen q = do
   sourceConfig <- askSourceConfig @('Postgres 'Vanilla) (iqSource q)
   userInfo <- askUserInfo
-  res <- convInsQ q
+  res <- convInsQ (orderedJsonInput sqlGen) q
   let strfyNum = stringifyNum sqlGen
   runTxWithCtx (_pscExecCtx sourceConfig) (Tx PG.ReadWrite Nothing) LegacyRQLQuery
     $ flip runReaderT emptyQueryTagsComment
     $ execInsertQuery strfyNum Nothing userInfo res
 
-decodeInsObjs :: (UserInfoM m, QErrM m) => Value -> m [InsObj ('Postgres 'Vanilla)]
+-- | Decode the @objects@ array without losing key order.
+--
+-- 'decodeValue' is still what validates the shape, so its errors are unchanged;
+-- it runs on the aeson projection of each column value, and the ordered value is
+-- kept alongside for the column builders to use.
+-- | Validate with the ordinary aeson decoder, then put the order-preserving
+-- value back in place of each column's sorted one.
+--
+-- Same shape as 'Hasura.GraphQL.Transport.HTTP.Protocol.withOrderedVariables'
+-- on the GraphQL side, and for the same reason: a second hand-written decoder
+-- would mean a second set of validation and error messages to keep in step.
+-- The key set is whatever the aeson decode produced, so this cannot add, drop
+-- or rename a column, and a column missing from the ordered parse keeps the
+-- value it already had.
+decodeOrderedInsObjs :: (QErrM m) => JO.Value -> m [InsObj ('Postgres 'Vanilla)]
+decodeOrderedInsObjs v = do
+  sortedObjs :: [ColumnValues ('Postgres 'Vanilla) Value] <- decodeValue (JO.fromOrdered v)
+  pure $ zipWith restore (orderedObjs <> repeat Nothing) sortedObjs
+  where
+    -- A successful 'decodeValue' above means every element really is an object.
+    orderedObjs = case v of
+      JO.Array arr -> map asObject (toList arr)
+      _ -> []
+    asObject = \case
+      JO.Object o -> Just o
+      _ -> Nothing
+    restore mObj =
+      HashMap.mapWithKey \col sortedVal ->
+        fromMaybe (JO.toOrdered sortedVal) (mObj >>= JO.lookup (getPGColTxt col))
+
+decodeInsObjs :: (UserInfoM m, QErrM m) => JO.Value -> m [InsObj ('Postgres 'Vanilla)]
 decodeInsObjs v = do
-  objs <- decodeValue v
+  objs <- decodeOrderedInsObjs v
   when (null objs) $ throw400 UnexpectedPayload "objects should not be empty"
   return objs

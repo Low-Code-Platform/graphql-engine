@@ -36,6 +36,7 @@ import Data.Has
 import Data.HashMap.Strict.Extended qualified as HashMap
 import Data.HashMap.Strict.InsOrd.Extended qualified as InsOrdHashMap
 import Data.HashSet qualified as HS
+import Data.IORef (readIORef)
 import Data.Proxy
 import Data.Sequence qualified as Seq
 import Data.Set qualified as S
@@ -49,8 +50,12 @@ import Hasura.Eventing.Backend
 import Hasura.Function.API
 import Hasura.Function.Cache
 import Hasura.Function.Metadata (FunctionMetadata (..))
-import Hasura.GraphQL.Schema (buildGQLContext)
+import Hasura.GraphQL.Context (GQLContext, RoleContext)
+import Hasura.GraphQL.Schema (RoleContextValue, SchemaFieldParsers, assemblePerPairContexts, buildAllRoleParsersForSchema, buildGQLContext, buildSchemaOptions, partitionSourceBySchema)
+import Hasura.GraphQL.Schema.TableFieldCache (TableFieldStore, newTableFieldStore)
+import Hasura.GraphQL.Schema.Backend (BackendSchema)
 import Hasura.GraphQL.Schema.Common
+import Hasura.GraphQL.Schema.Instances ()
 import Hasura.Incremental qualified as Inc
 import Hasura.Logging
 import Hasura.LogicalModel.Cache (LogicalModelCache, LogicalModelInfo (..))
@@ -78,6 +83,8 @@ import Hasura.RQL.DDL.Schema.Cache.Common
 import Hasura.RQL.DDL.Schema.Cache.Config
 import Hasura.RQL.DDL.Schema.Cache.Dependencies
 import Hasura.RQL.DDL.Schema.Cache.Fields
+import Hasura.Backends.Postgres.SQL.Types (SchemaName)
+import Hasura.RQL.DDL.Schema.Cache.PartialRebuild (freshIntrospectionOverride, partitionIntrospectionBySchema)
 import Hasura.RQL.DDL.Schema.Cache.Permission
 import Hasura.RQL.DDL.SchemaRegistry
 import Hasura.RQL.Types.Action
@@ -97,6 +104,7 @@ import Hasura.RQL.Types.NamingCase
 import Hasura.RQL.Types.OpenTelemetry
 import Hasura.RQL.Types.QueryCollection
 import Hasura.RQL.Types.Relationships.Remote
+import Hasura.RQL.Types.Schema.Options qualified as Options
 import Hasura.RQL.Types.ScheduledTrigger
 import Hasura.RQL.Types.SchemaCache
 import Hasura.RQL.Types.SchemaCache.Build
@@ -169,9 +177,14 @@ buildRebuildableSchemaCache ::
   Maybe SchemaRegistryContext ->
   CacheBuild RebuildableSchemaCache
 buildRebuildableSchemaCache logger env disableNativeQueryValidation metadataWithVersion dynamicConfig mSchemaRegistryContext = do
+  -- One store per 'RebuildableSchemaCache': the rule closes over it, so every
+  -- rebuild driven by 'Inc.rebuildRule' sees the caches left by the previous one.
+  -- Rebuilds are serialised by the 'AppStateRef' lock, so a plain IORef is safe.
+  -- (A fresh 'RebuildableSchemaCache' starts cold — correct, just slower.)
+  memoStore <- newTableFieldStore
   result <-
     flip runReaderT CatalogSync
-      $ Inc.build (buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryContext) (metadataWithVersion, dynamicConfig, initialInvalidationKeys, Nothing)
+      $ Inc.build (buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryContext memoStore) (metadataWithVersion, dynamicConfig, initialInvalidationKeys, Nothing)
 
   pure $ RebuildableSchemaCache (fst $ Inc.result result) initialInvalidationKeys (Inc.rebuildRule result)
 
@@ -405,33 +418,6 @@ buildSourcesIntrospectionStatus sourcesMetadata remoteSchemasMetadata = \case
     allPresent :: (Hashable a) => [a] -> InsOrdHashMap a b -> Bool
     allPresent list = all (`elem` list) . InsOrdHashMap.keys
 
-{- Note [Avoiding GraphQL schema rebuilds when changing irrelevant Metadata]
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-There are many Metadata operations that don't influence the GraphQL schema.  So
-we should be caching its construction.
-
-The `Hasura.Incremental` framework allows us to cache such constructions:
-whenever we have an arrow `Rule m a b`, where `a` is the input to the arrow and
-`b` the output, we can use the `Inc.cache` combinator to obtain a new arrow
-which is only re-executed when the input `a` changes in a material way.  To test
-this, `a` needs an `Eq` instance.
-
-We can't simply apply `Inc.cache` to the GraphQL schema cache building phase
-(`buildGQLContext`), because the inputs (components of `BuildOutputs` such as
-`SourceCache`) don't have an `Eq` instance.
-
-So the purpose of `buildOutputsAndSchema` is that we cach already at an earlier
-point, encompassing more computation.  The Metadata and invalidation keys (which
-have `Eq` instances) are used as a caching key, and `Inc.cache` can be applied
-to the whole sequence of steps.
-
-But because of the all-or-nothing nature of caching, it's important that
-`buildOutputsAndSchema` is re-run as little as possible.  So the exercise
-becomes to minimize the amount of stuff stored in `BuildOutputs`, so that as
-many Metadata operations as possible can be handled outside of this codepath
-that produces a GraphQL schema.
--}
-
 buildSchemaCacheRule ::
   -- Note: by supplying BuildReason via MonadReader, it does not participate in caching, which is
   -- what we want!
@@ -450,16 +436,21 @@ buildSchemaCacheRule ::
   Env.Environment ->
   DisableNativeQueryValidation ->
   Maybe SchemaRegistryContext ->
+  -- | Persisted per-(source, schema, role) table field caches (Phase 9). Created
+  -- once per 'RebuildableSchemaCache' and reused by every rebuild, so an unchanged
+  -- table's parsers survive across metadata changes. Only consulted when
+  -- the per-table schema cache is enabled (the default).
+  TableFieldStore ->
   (MetadataWithResourceVersion, CacheDynamicConfig, InvalidationKeys, Maybe StoredIntrospection)
     `arr` (SchemaCache, (SourcesIntrospectionStatus, SchemaRegistryAction))
-buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryContext = proc (MetadataWithResourceVersion metadataNoDefaults interimMetadataResourceVersion, dynamicConfig, invalidationKeys, storedIntrospection) -> do
+buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryContext memoStore = proc (MetadataWithResourceVersion metadataNoDefaults interimMetadataResourceVersion, dynamicConfig, invalidationKeys, storedIntrospection) -> do
   invalidationKeysDep <- Inc.newDependency -< invalidationKeys
   let metadataDefaults = _cdcMetadataDefaults dynamicConfig
       metadata@Metadata {..} = overrideMetadataDefaults metadataNoDefaults metadataDefaults
   metadataDep <- Inc.newDependency -< metadata
 
-  (inconsistentObjects, storedIntrospections, (resolvedOutputs, dependencyInconsistentObjects, resolvedDependencies), ((adminIntrospection, gqlContext, gqlContextUnauth, inconsistentRemoteSchemas), (relayContext, relayContextUnauth), schemaRegistryAction)) <-
-    Inc.cache buildOutputsAndSchema -< (metadataDep, dynamicConfig, invalidationKeysDep, storedIntrospection)
+  (inconsistentObjects, storedIntrospections, (resolvedOutputs, dependencyInconsistentObjects, resolvedDependencies), ((adminIntrospection, gqlContext, gqlContextUnauth, rootFieldSchema, inconsistentRemoteSchemas), (relayContext, relayContextUnauth), schemaRegistryAction)) <-
+    buildOutputsAndSchema -< (metadataDep, dynamicConfig, invalidationKeysDep, storedIntrospection)
 
   let storedIntrospectionStatus = buildSourcesIntrospectionStatus _metaSources _metaRemoteSchemas storedIntrospections
       (resolvedEndpoints, endpointCollectedInfo) = runIdentity $ runWriterT $ buildRESTEndpoints _metaQueryCollections (InsOrdHashMap.elems _metaRestEndpoints)
@@ -523,6 +514,7 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
             scAdminIntrospection = adminIntrospection,
             scGQLContext = gqlContext,
             scUnauthenticatedGQLContext = gqlContextUnauth,
+            scRootFieldSchema = rootFieldSchema,
             scRelayContext = relayContext,
             scUnauthenticatedRelayContext = relayContextUnauth,
             -- , scGCtxMap = gqlSchema
@@ -576,27 +568,216 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
 
   returnA -< (schemaCache, (storedIntrospectionStatus, schemaRegistryAction))
   where
-    -- See Note [Avoiding GraphQL schema rebuilds when changing irrelevant Metadata]
     buildOutputsAndSchema = proc (metadataDep, dynamicConfig, invalidationKeysDep, storedIntrospection) -> do
       (outputs, collectedInfo) <- runWriterA buildAndCollectInfo -< (dynamicConfig, metadataDep, invalidationKeysDep, storedIntrospection)
       let (inconsistentObjects, unresolvedDependencies, storedIntrospections) = partitionCollectedInfo collectedInfo
       out2@(resolvedOutputs, _dependencyInconsistentObjects, _resolvedDependencies) <- resolveDependencies -< (outputs, unresolvedDependencies)
-      out3 <-
-        bindA
-          -< do
-            buildGQLContext
-              (_cdcSchemaSampledFeatureFlags dynamicConfig)
-              (_cdcFunctionPermsCtx dynamicConfig)
-              (_cdcRemoteSchemaPermsCtx dynamicConfig)
+      let sources = _boSources resolvedOutputs
+          allRemoteSchemas = _boRemoteSchemas resolvedOutputs
+          allActions = _boActions resolvedOutputs
+          allActionInfos = HashMap.elems allActions
+          schemaOptions =
+            buildSchemaOptions
+              (_cdcSQLGenCtx dynamicConfig, _cdcFunctionPermsCtx dynamicConfig)
               (_cdcExperimentalFeatures dynamicConfig)
-              (_cdcSQLGenCtx dynamicConfig)
-              (_cdcApolloFederationStatus dynamicConfig)
-              (_boSources resolvedOutputs)
-              (_boRemoteSchemas resolvedOutputs)
-              (_boActions resolvedOutputs)
-              (_boCustomTypes resolvedOutputs)
-              mSchemaRegistryContext
-              logger
+          -- Compute all roles from sources, actions, and remote schemas.
+          remoteSchemasRoles =
+            concatMap (HashMap.keys . _rscPermissions . fst . snd)
+              $ HashMap.toList allRemoteSchemas
+          actionRoles =
+            HS.insert adminRoleName
+              $ HS.fromList (allActionInfos ^.. folded . aiPermissions . to HashMap.keys . folded)
+              <> HS.fromList
+                ( bool mempty remoteSchemasRoles
+                    $ _cdcRemoteSchemaPermsCtx dynamicConfig
+                    == Options.EnableRemoteSchemaPermissions
+                )
+          allTableRoles = HS.fromList $ getTableRoles =<< HashMap.elems sources
+          allLogicalModelRoles = HS.fromList $ getLogicalModelRoles =<< HashMap.elems sources
+          allRoles = HS.toList $ actionRoles <> allTableRoles <> allLogicalModelRoles
+          remoteSchemaCtxs = fst <$> allRemoteSchemas
+          sourceSchemaKeysDep = Inc.selectD #_ikSourceSchemas invalidationKeysDep
+          metadataKeyDep = Inc.selectD #_ikMetadata invalidationKeysDep
+
+      -- Build per-role GQL field parsers for all sources, with each
+      -- (source, DB schema) pair cached independently in 'buildSchemaParsersForSchema'
+      -- so that DDL on one schema does not invalidate the others
+      -- (Phase 6 RFC, Step 5). Alongside the parsers, collect the
+      -- per-(source, schema) 'Inc.InvalidationKey' that was actually used, so
+      -- that 'buildGQLContextCached' below can be keyed off the same
+      -- invalidation granularity.
+      perSourceParsersAndKeys <-
+        (|
+          Inc.keyed
+            ( \_sourceName backendSourceInfo ->
+                AB.dispatchAnyBackendArrow @BackendSchema @BackendMetadata
+                  ( proc
+                      ( si :: SourceInfo b,
+                        (sources', remoteSchemaCtxs', schemaOptions', remoteSchemaPermsCtx', sff', allRoles', sourceSchemaKeysDep', metadataKeyDep', dynamicConfig', mSchemaRegistryContext')
+                        )
+                    -> do
+                      let sourceName = _siName si
+                          schemaMap = partitionSourceBySchema @b si
+                      perSchemaResults <-
+                        (|
+                          Inc.keyed
+                            ( \schemaName (filteredSi, schemaKeyDep) -> do
+                                metadataKeyValue <- Inc.dependOn -< metadataKeyDep'
+                                schemaKeyValue <- Inc.dependOn -< schemaKeyDep
+                                let effectiveInvalidationKey = fromMaybe metadataKeyValue schemaKeyValue
+                                    -- Content fingerprint of the resolved, schema-filtered SourceInfo.
+                                    -- The invalidation keys above do NOT move for ordinary metadata
+                                    -- mutations: track/untrack/permission/relationship all go through
+                                    -- plain 'buildSchemaCache', which fires neither 'ciMetadata' nor
+                                    -- 'ciSourceSchemas'. Without this fingerprint, 'buildSchemaParsersForSchema'
+                                    -- (whose 'KeyedBy' compares only the key, ignoring 'filteredSi') would
+                                    -- serve stale parsers — e.g. a newly tracked table in an existing
+                                    -- schema would never appear. TableInfo/FunctionInfo/etc. have ToJSON,
+                                    -- and '_siTables' JSON includes columns, permissions and relationships,
+                                    -- so this also captures DB-introspection changes (e.g. run_sql ALTER)
+                                    -- for free.
+                                    --
+                                    -- We can't 'toJSON' the caches directly (their 'TableName'/'FunctionName'
+                                    -- keys have no 'ToJSONKey' under 'BackendMetadata b', and 'HashMap.elems'
+                                    -- order is non-deterministic). Instead we serialize each value (the name
+                                    -- is embedded in the value) and sort by its encoding for a stable,
+                                    -- key-class-free fingerprint.
+                                    fingerprintCache :: (ToJSON v) => HashMap.HashMap k v -> Value
+                                    fingerprintCache = toJSON . sortOn encode . map toJSON . HashMap.elems
+                                    -- Per-table fingerprints, computed ONCE and shared: this key needs
+                                    -- them, and so does the Phase 9 per-table field cache, which decides
+                                    -- from them which tables changed. Computing 'toJSON' over every
+                                    -- TableInfo twice was O(total) duplicated work on every build
+                                    -- (rfcs/phase9-per-table-field-cache.md, and §10.2 of the Phase 8 RFC).
+                                    tableFingerprints :: HashMap.HashMap (TableName b) Value
+                                    tableFingerprints = toJSON <$> _siTables filteredSi
+                                    schemaContentKey =
+                                      toJSON
+                                        [ -- same shape fingerprintCache would produce, reusing the
+                                          -- fingerprints above rather than recomputing them
+                                          toJSON (sortOn encode (HashMap.elems tableFingerprints)),
+                                          fingerprintCache (_siFunctions filteredSi),
+                                          fingerprintCache (_siNativeQueries filteredSi),
+                                          fingerprintCache (_siStoredProcedures filteredSi),
+                                          fingerprintCache (_siLogicalModels filteredSi)
+                                        ]
+                                    -- 'dynamicConfig'' is part of the key because the parsers AND the
+                                    -- assembled context both depend on it (SQL-gen flags, experimental
+                                    -- features, Apollo federation, etc.); a config change must rebuild both.
+                                    effectiveKey = (schemaContentKey, effectiveInvalidationKey, allRoles', dynamicConfig')
+                                parsers <-
+                                  buildSchemaParsersForSchema
+                                    -<
+                                      KeyedBy
+                                        effectiveKey
+                                        (schemaName, tableFingerprints, sff', schemaOptions', sources', remoteSchemaCtxs', remoteSchemaPermsCtx', allRoles', filteredSi)
+                                -- §5.3 "where the win is": assemble this pair's per-role 'GQLContext'
+                                -- right here, behind the SAME per-(source, schema) 'Inc.cache' key as its
+                                -- parsers, so a mutation to one pair re-assembles only that pair. Keyed on
+                                -- 'effectiveKey' (which includes 'schemaContentKey'), so the contexts
+                                -- rebuild when a schema's content changes (e.g. 'run_sql' ALTER ADD COLUMN)
+                                -- even though the invalidation keys don't move.
+                                pairContexts <-
+                                  assembleSchemaContextForSchema
+                                    -<
+                                      KeyedBy
+                                        effectiveKey
+                                        (dynamicConfig', sources', mSchemaRegistryContext', parsers)
+                                returnA -< ((parsers, pairContexts), (schemaContentKey, effectiveInvalidationKey))
+                            )
+                          |)
+                          ( HashMap.mapWithKey
+                              (\schemaName filteredSi -> (filteredSi, Inc.selectKeyD (sourceName, schemaName) sourceSchemaKeysDep'))
+                              schemaMap
+                          )
+                      -- Keep the per-schema results UN-merged so each (source, schema) pair stays
+                      -- independent (Phase 1). Each entry carries that DB schema's per-role
+                      -- 'SchemaFieldParsers' (for the routing index) and its per-role assembled
+                      -- 'RoleContextValue' (the cached context).
+                      let perSchemaParsers = (fst . fst) <$> perSchemaResults
+                          perSchemaContexts = (snd . fst) <$> perSchemaResults
+                          schemaKeys = snd <$> perSchemaResults
+                      returnA -< ((perSchemaParsers, perSchemaContexts), schemaKeys)
+                  )
+                  -<
+                    ( backendSourceInfo,
+                      (sources, remoteSchemaCtxs, schemaOptions, _cdcRemoteSchemaPermsCtx dynamicConfig, _cdcSchemaSampledFeatureFlags dynamicConfig, allRoles, sourceSchemaKeysDep, metadataKeyDep, dynamicConfig, mSchemaRegistryContext)
+                    )
+            )
+          |)
+          sources
+
+      -- Invert the per-source/per-schema/per-role parser maps into the
+      -- per-role, per-(source, schema) shape that 'buildGQLContext' consumes.
+      -- No cross-pair merge: each (source, schema) keeps its own parsers so it
+      -- can be assembled and cached independently (Phase 1). Used only to build
+      -- the root-field routing index.
+      let perPairParsers :: HashMap RoleName (HashMap (SourceName, SchemaName) SchemaFieldParsers)
+          perPairParsers =
+            HashMap.fromListWith
+              (HashMap.unionWith (<>))
+              [ (role, HashMap.singleton (sourceName, schemaName) roleParsers)
+                | (sourceName, ((perSchemaParsers, _perSchemaContexts), _)) <- HashMap.toList perSourceParsersAndKeys,
+                  (schemaName, roleParsers') <- HashMap.toList perSchemaParsers,
+                  (role, roleParsers) <- HashMap.toList roleParsers'
+              ]
+
+          -- The per-(source, schema) assembled contexts, inverted to the
+          -- per-role, per-pair shape 'buildGQLContext' stitches together (§5.3).
+          -- Each value was assembled + cached independently per pair above.
+          -- '(SourceName, SchemaName)' is globally unique, so each (role, pair)
+          -- occurs once: 'HashMap.union' suffices (and 'RoleContextValue' has no
+          -- 'Semigroup', so 'unionWith (<>)' would not even typecheck).
+          perRolePairContexts :: HashMap RoleName (HashMap (SourceName, SchemaName) RoleContextValue)
+          perRolePairContexts =
+            HashMap.fromListWith
+              HashMap.union
+              [ (role, HashMap.singleton (sourceName, schemaName) roleContext)
+                | (sourceName, ((_perSchemaParsers, perSchemaContexts), _)) <- HashMap.toList perSourceParsersAndKeys,
+                  (schemaName, roleContexts') <- HashMap.toList perSchemaContexts,
+                  (role, roleContext) <- HashMap.toList roleContexts'
+              ]
+
+          perSourceSchemaKeys :: HashMap SourceName (HashMap SchemaName (Value, Inc.InvalidationKey))
+          perSourceSchemaKeys = snd <$> perSourceParsersAndKeys
+
+      metadataValue <- Inc.dependOn -< metadataDep
+      remoteSchemaInvalidationKeys <- Inc.dependOn -< Inc.selectD #_ikRemoteSchemas invalidationKeysDep
+
+      -- The full GQL context (per-role parsers, introspection schemas, etc.)
+      -- is expensive to assemble and is otherwise rebuilt on every
+      -- 'buildOutputsAndSchema' invocation (Phase 6 RFC, Step 7 removed the
+      -- coarse outer 'Inc.cache'). Cache it, keyed on everything that can
+      -- affect its output: metadata content (covers actions, custom types,
+      -- remote schema definitions, source/table tracking), the per-schema
+      -- content fingerprint + invalidation keys actually used to build
+      -- 'mergedParsers' (so DB-introspection changes like 'run_sql' ALTER
+      -- invalidate the context too), remote schema invalidation
+      -- (covers remote introspection refresh), the active role set, and the
+      -- dynamic schema-build configuration.
+      let gqlContextCacheKey :: GQLContextCacheKey
+          gqlContextCacheKey = (metadataValue, perSourceSchemaKeys, remoteSchemaInvalidationKeys, allRoles, dynamicConfig)
+
+      out3 <-
+        buildGQLContextCached
+          -<
+            KeyedBy
+              gqlContextCacheKey
+              ( _cdcSchemaSampledFeatureFlags dynamicConfig,
+                _cdcFunctionPermsCtx dynamicConfig,
+                _cdcRemoteSchemaPermsCtx dynamicConfig,
+                _cdcExperimentalFeatures dynamicConfig,
+                _cdcSQLGenCtx dynamicConfig,
+                _cdcApolloFederationStatus dynamicConfig,
+                sources,
+                perPairParsers,
+                perRolePairContexts,
+                allRemoteSchemas,
+                allActions,
+                _boCustomTypes resolvedOutputs,
+                mSchemaRegistryContext,
+                logger
+              )
       returnA -< (inconsistentObjects, storedIntrospections, out2, out3)
 
     resolveBackendInfo' ::
@@ -802,6 +983,290 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
           returnA -< (RETDoNothing, SCMSUninitializedSource)
         Just (recreateEventTriggers, catalogMigrationState) -> returnA -< (recreateEventTriggers, catalogMigrationState)
 
+    -- Per-schema wrapper around 'buildTableCache'.
+    --
+    -- 'Inc.cache'-wraps the call so that each schema's table-cache is memoised
+    -- independently.  The schema-specific 'Inc.Dependency' (drawn from
+    -- '_ikSourceSchemas') is opened inside the block so that only the targeted
+    -- schema's entry is invalidated when 'ciSourceSchemas' fires; all other
+    -- schemas are served from cache.
+    buildTableCacheForSchema ::
+      forall b arr m.
+      ( ArrowChoice arr,
+        Inc.ArrowDistribute arr,
+        ArrowWriter (Seq CollectItem) arr,
+        Inc.ArrowCache m arr,
+        MonadIO m,
+        MonadBaseControl IO m,
+        BackendMetadata b
+      ) =>
+      ( SourceName,
+        SourceConfig b,
+        SchemaName,
+        DBObjectsIntrospection b,
+        [TableBuildInput b],
+        Inc.Dependency (Maybe Inc.InvalidationKey),
+        Inc.Dependency Inc.InvalidationKey,
+        NamingCase,
+        LogicalModels b
+      )
+        `arr` HashMap (TableName b) (TableCoreInfoG b (StructuredColumnInfo b) (ColumnInfo b))
+    buildTableCacheForSchema = Inc.cache proc
+      ( sourceName,
+        sourceConfig,
+        _schemaName,
+        schemaIntrospection,
+        schemaTableInputs,
+        schemaKeyDep,
+        metadataKey,
+        namingConv,
+        logicalModels
+        ) -> do
+      metadataKeyValue <- Inc.dependOn -< metadataKey
+      schemaKeyValue <- Inc.dependOn -< schemaKeyDep
+      -- Use the per-schema key when available; fall back to the metadata key so
+      -- that a full metadata reload still propagates to buildTableCache.
+      let effectiveKey = fromMaybe metadataKeyValue schemaKeyValue
+      effectiveKeyDep <- Inc.newDependency -< effectiveKey
+      buildTableCache
+        -< ( sourceName,
+             sourceConfig,
+             _rsTables schemaIntrospection,
+             schemaTableInputs,
+             effectiveKeyDep,
+             namingConv,
+             logicalModels
+           )
+
+    -- §12 (Phase 3): per-(source, DB schema) resolution of the table half of
+    -- 'buildSource' — relationships/computed fields ('addNonColumnFields') and
+    -- permissions ('buildTablePermissions') for ONE schema's tables. 'Inc.cache'd
+    -- on the schema's inputs (mirrors 'buildTableCacheForSchema') so a mutation to
+    -- one schema re-resolves only that schema's 'TableInfo's instead of all of the
+    -- source's. Safe under locked decision 3 (no cross-schema/cross-source
+    -- relationships): each schema's tables are resolved against only that schema's
+    -- slice ('rawTableInfos'), so any cross-schema reference fails to resolve and
+    -- surfaces as an inconsistency. With decisions 1+3 the @allSources@ /
+    -- remote-schema inputs to 'addNonColumnFields' are unused, so 'mempty' is
+    -- passed, keeping the cache key schema-local.
+    buildTableInfosForSchema ::
+      forall b arr m.
+      ( ArrowChoice arr,
+        Inc.ArrowCache m arr,
+        ArrowWriter (Seq CollectItem) arr,
+        MonadError QErr m,
+        MonadIO m,
+        MonadBaseControl IO m,
+        BackendMetadata b,
+        GetAggregationPredicatesDeps b
+      ) =>
+      ( SourceName,
+        SourceConfig b,
+        -- this schema's resolved table-core info (from 'buildTableCacheForSchema')
+        HashMap (TableName b) (TableCoreInfoG b (StructuredColumnInfo b) (ColumnInfo b)),
+        -- this schema's non-column inputs / permission inputs / event triggers
+        [NonColumnTableInputs b],
+        [TablePermissionInputs b],
+        HashMap (TableName b) (EventTriggerInfoMap b),
+        OrderedRoles,
+        HashMap LogicalModelName (LogicalModelMetadata b),
+        DBFunctionsMetadata b
+      )
+        `arr` HashMap (TableName b) (TableInfo b)
+    buildTableInfosForSchema = Inc.cache proc
+      (sourceName, sourceConfig, tablesRawInfo, nonColumnInputs, permissions, eventTriggerInfoMaps, orderedRoles, unifiedLogicalModelsHashMap, dbFunctions) -> do
+        let alignTableMap :: HashMap (TableName b) a -> HashMap (TableName b) c -> HashMap (TableName b) (a, c)
+            alignTableMap = HashMap.intersectionWith (,)
+            nonColumnsByTable = mapFromL _nctiTable nonColumnInputs
+
+        -- relationships and computed fields (intra-schema only, per decision 3)
+        tableCoreInfos :: HashMap (TableName b) (TableCoreInfo b) <-
+          interpretWriter
+            -< for (tablesRawInfo `alignTableMap` nonColumnsByTable) \(tableRawInfo, nonColumnInput) -> do
+              let columns = _tciFieldInfoMap tableRawInfo
+              allFields :: FieldInfoMap (FieldInfo b) <- addNonColumnFields mempty sourceName sourceConfig tablesRawInfo columns mempty dbFunctions nonColumnInput
+              pure $ tableRawInfo {_tciFieldInfoMap = allFields}
+
+        -- permissions
+        result <-
+          interpretWriter
+            -< runExceptT
+              $ for
+                (tableCoreInfos `alignTableMap` mapFromL _tpiTable permissions `alignTableMap` eventTriggerInfoMaps)
+                \((tableCoreInfo, permissionInputs), eventTriggerInfos) -> do
+                  let tableFields = _tciFieldInfoMap tableCoreInfo
+                  permissionInfos <-
+                    buildTablePermissions
+                      env
+                      sourceName
+                      sourceConfig
+                      tableCoreInfos
+                      (_tciName tableCoreInfo)
+                      tableFields
+                      permissionInputs
+                      orderedRoles
+                      unifiedLogicalModelsHashMap
+                  pure $ TableInfo tableCoreInfo permissionInfos eventTriggerInfos (mkAdminRolePermInfo tableCoreInfo)
+        bindA -< liftEither result
+
+    -- Per-(source, DB schema) wrapper around 'buildAllRoleParsersForSchema'.
+    --
+    -- 'Inc.cache'-wraps the call so that each schema's GQL field parsers are
+    -- memoised independently. 'SourceInfo b' and 'SourceCache' have no useful
+    -- 'Eq' instance, so they are carried in the un-compared payload of
+    -- 'KeyedBy' -- caching is driven entirely by 'effectiveKey', which combines
+    -- the schema/metadata 'Inc.InvalidationKey' (see 'buildTableCacheForSchema')
+    -- with the current role list, so that adding/removing a role also
+    -- triggers a rebuild.
+    buildSchemaParsersForSchema ::
+      forall b arr m.
+      ( ArrowChoice arr,
+        Inc.ArrowCache m arr,
+        MonadError QErr m,
+        MonadIO m,
+        BackendSchema b,
+        BackendMetadata b
+      ) =>
+      KeyedBy
+        -- (per-schema content fingerprint, effective invalidation key, role set,
+        -- dynamic schema-build config)
+        (Value, Inc.InvalidationKey, [RoleName], CacheDynamicConfig)
+        ( SchemaName,
+          HashMap (TableName b) Value,
+          SchemaSampledFeatureFlags,
+          Options.SchemaOptions,
+          SourceCache,
+          HashMap RemoteSchemaName RemoteSchemaCtx,
+          Options.RemoteSchemaPermissions,
+          [RoleName],
+          SourceInfo b
+        )
+        `arr` HashMap RoleName SchemaFieldParsers
+    buildSchemaParsersForSchema = Inc.cache proc
+      (KeyedBy (_, _, _, dynConfig) (schemaName, tableFingerprints, sampledFeatureFlags, schemaOptions, sources, remotes, remoteSchemaPermsCtx, roles, filteredSi)) -> do
+        -- 'memoStore' is a parameter of 'buildSchemaCacheRule', so it is in scope
+        -- here and does not need threading through the arrow. ON by default;
+        -- 'Nothing' restores the unconditional per-table rebuild.
+        let mMemoStore =
+              if EFDisablePerTableSchemaCache `HS.member` _cdcExperimentalFeatures dynConfig
+                then Nothing
+                else Just memoStore
+        bindA -< buildAllRoleParsersForSchema mMemoStore schemaName tableFingerprints sampledFeatureFlags schemaOptions sources remotes remoteSchemaPermsCtx roles filteredSi
+
+    -- §5.3: per-(source, DB schema) assembly of the per-role 'GQLContext',
+    -- 'Inc.cache'd under the SAME 'effectiveKey' as the pair's parsers. This is
+    -- the expensive introspection-building step; caching it per pair is what
+    -- makes a mutation to one pair re-assemble only that pair. The parsers,
+    -- 'SourceCache' and registry context have no useful 'Eq' and ride in the
+    -- un-compared 'KeyedBy' payload; 'CacheDynamicConfig' is in the key so a
+    -- config change rebuilds the context.
+    assembleSchemaContextForSchema ::
+      forall arr m.
+      ( ArrowChoice arr,
+        Inc.ArrowCache m arr,
+        MonadError QErr m,
+        MonadIO m
+      ) =>
+      KeyedBy
+        (Value, Inc.InvalidationKey, [RoleName], CacheDynamicConfig)
+        ( CacheDynamicConfig,
+          SourceCache,
+          Maybe SchemaRegistryContext,
+          HashMap RoleName SchemaFieldParsers
+        )
+        `arr` HashMap RoleName RoleContextValue
+    assembleSchemaContextForSchema = Inc.cache proc
+      (KeyedBy _effectiveKey (dynamicConfig, sources, mSchemaRegistryCtx, roleParsers)) ->
+        bindA
+          -< assemblePerPairContexts
+            (_cdcSchemaSampledFeatureFlags dynamicConfig)
+            (_cdcSQLGenCtx dynamicConfig, _cdcFunctionPermsCtx dynamicConfig)
+            sources
+            (_cdcRemoteSchemaPermsCtx dynamicConfig)
+            (_cdcExperimentalFeatures dynamicConfig)
+            (_cdcApolloFederationStatus dynamicConfig)
+            mSchemaRegistryCtx
+            roleParsers
+
+    -- 'Inc.cache'-wraps the FINALIZATION of the GQL/Relay contexts
+    -- ('buildGQLContext'). After §5.3 the expensive per-pair assembly is cached
+    -- per (source, schema) in 'assembleSchemaContextForSchema' and arrives here
+    -- already built ('perRolePairContexts'); this step only stitches the cached
+    -- pairs together (introspection merge, routing index, lazy Relay) and is
+    -- cheap. Caching is driven entirely by 'GQLContextCacheKey' (see its
+    -- definition); 'SourceCache', 'SchemaFieldParsers', etc. have no useful 'Eq'
+    -- instance and are carried in the un-compared payload of 'KeyedBy'.
+    buildGQLContextCached ::
+      forall arr m.
+      ( ArrowChoice arr,
+        Inc.ArrowCache m arr,
+        MonadError QErr m,
+        MonadIO m
+      ) =>
+      KeyedBy
+        GQLContextCacheKey
+        ( SchemaSampledFeatureFlags,
+          Options.InferFunctionPermissions,
+          Options.RemoteSchemaPermissions,
+          HashSet ExperimentalFeature,
+          SQLGenCtx,
+          ApolloFederationStatus,
+          SourceCache,
+          HashMap RoleName (HashMap (SourceName, SchemaName) SchemaFieldParsers),
+          HashMap RoleName (HashMap (SourceName, SchemaName) RoleContextValue),
+          HashMap RemoteSchemaName (RemoteSchemaCtx, MetadataObject),
+          ActionCache,
+          AnnotatedCustomTypes,
+          Maybe SchemaRegistryContext,
+          Logger Hasura
+        )
+        `arr` ( ( G.SchemaIntrospection,
+                  HashMap RoleName (HashMap (SourceName, SchemaName) (RoleContext GQLContext)),
+                  HashMap (SourceName, SchemaName) GQLContext,
+                  HashMap G.Name (SourceName, SchemaName),
+                  HashSet InconsistentMetadata
+                ),
+                ( HashMap RoleName (RoleContext GQLContext),
+                  GQLContext
+                ),
+                SchemaRegistryAction
+              )
+    buildGQLContextCached = Inc.cache proc
+      ( KeyedBy
+          _key
+          ( sampledFeatureFlags,
+            functionPermsCtx,
+            remoteSchemaPermsCtx,
+            experimentalFeatures,
+            sqlGenCtx,
+            apolloFederationStatus,
+            sources,
+            perPairParsers,
+            perRolePairContexts,
+            remotes,
+            actions,
+            customTypes,
+            schemaRegistryContext,
+            gqlLogger
+            )
+        ) ->
+        bindA
+          -< buildGQLContext
+            sampledFeatureFlags
+            functionPermsCtx
+            remoteSchemaPermsCtx
+            experimentalFeatures
+            sqlGenCtx
+            apolloFederationStatus
+            sources
+            perPairParsers
+            perRolePairContexts
+            remotes
+            actions
+            customTypes
+            schemaRegistryContext
+            gqlLogger
+
     buildSource ::
       forall b arr m.
       ( ArrowChoice arr,
@@ -814,60 +1279,28 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
         GetAggregationPredicatesDeps b
       ) =>
       ( CacheDynamicConfig,
-        HashMap SourceName (AB.AnyBackend PartiallyResolvedSource),
         SourceMetadata b,
         SourceConfig b,
-        HashMap (TableName b) (TableCoreInfoG b (StructuredColumnInfo b) (ColumnInfo b)),
-        HashMap (TableName b) (EventTriggerInfoMap b),
+        -- pre-built per-(source, schema) table cache (Phase 3, §12): the table
+        -- half of source resolution is now done + cached per schema in
+        -- 'buildTableInfosForSchema', and the slices are unioned by the caller.
+        HashMap (TableName b) (TableInfo b),
         DBObjectsIntrospection b,
-        PartiallyResolvedRemoteSchemaMap,
         OrderedRoles
       )
         `arr` (SourceInfo b)
-    buildSource = proc (dynamicConfig, allSources, sourceMetadata, sourceConfig, tablesRawInfo, eventTriggerInfoMaps, dbObjectsIntrospection, remoteSchemaMap, orderedRoles) -> do
+    buildSource = proc (dynamicConfig, sourceMetadata, sourceConfig, tableCache, dbObjectsIntrospection, orderedRoles) -> do
       let DBObjectsIntrospection _dbTables dbFunctions _scalars introspectedLogicalModels = dbObjectsIntrospection
-          SourceMetadata sourceName backendSourceKind tables functions nativeQueries storedProcedures logicalModels _ queryTagsConfig sourceCustomization _healthCheckConfig = sourceMetadata
-          tablesMetadata = InsOrdHashMap.elems tables
-          (_, nonColumnInputs, permissions) = unzip3 $ map mkTableInputs tablesMetadata
-          alignTableMap :: HashMap (TableName b) a -> HashMap (TableName b) c -> HashMap (TableName b) (a, c)
-          alignTableMap = HashMap.intersectionWith (,)
-
-      -- relationships and computed fields
-      let nonColumnsByTable = mapFromL _nctiTable nonColumnInputs
-      tableCoreInfos :: HashMap (TableName b) (TableCoreInfo b) <-
-        interpretWriter
-          -< for (tablesRawInfo `alignTableMap` nonColumnsByTable) \(tableRawInfo, nonColumnInput) -> do
-            let columns = _tciFieldInfoMap tableRawInfo
-            allFields :: FieldInfoMap (FieldInfo b) <- addNonColumnFields allSources sourceName sourceConfig tablesRawInfo columns remoteSchemaMap dbFunctions nonColumnInput
-            pure $ tableRawInfo {_tciFieldInfoMap = allFields}
+          SourceMetadata sourceName backendSourceKind _tables functions nativeQueries storedProcedures logicalModels _ queryTagsConfig sourceCustomization _healthCheckConfig = sourceMetadata
+          -- The table cache is pre-built per schema; derive the core infos that the
+          -- function / logical-model / native-query resolution below consumes.
+          tableCoreInfos :: HashMap (TableName b) (TableCoreInfo b)
+          tableCoreInfos = _tiCoreInfo <$> tableCache
 
       -- Combine logical models that come from DB schema introspection with logical models
       -- provided via metadata. If two logical models have the same name the one from metadata is preferred.
       let unifiedLogicalModels = logicalModels <> introspectedLogicalModels
           unifiedLogicalModelsHashMap = InsOrdHashMap.toHashMap unifiedLogicalModels
-
-      -- permissions
-      result <-
-        interpretWriter
-          -< runExceptT
-            $ for
-              (tableCoreInfos `alignTableMap` mapFromL _tpiTable permissions `alignTableMap` eventTriggerInfoMaps)
-              \((tableCoreInfo, permissionInputs), eventTriggerInfos) -> do
-                let tableFields = _tciFieldInfoMap tableCoreInfo
-                permissionInfos <-
-                  buildTablePermissions
-                    env
-                    sourceName
-                    sourceConfig
-                    tableCoreInfos
-                    (_tciName tableCoreInfo)
-                    tableFields
-                    permissionInputs
-                    orderedRoles
-                    unifiedLogicalModelsHashMap
-                pure $ TableInfo tableCoreInfo permissionInfos eventTriggerInfos (mkAdminRolePermInfo tableCoreInfo)
-      -- Generate a non-recoverable error when inherited roles were not ordered in a way that allows for building permissions to succeed
-      tableCache <- bindA -< liftEither result
 
       -- not forcing the evaluation here results in a measurable negative impact
       -- on memory residency as measured by our benchmark
@@ -1262,21 +1695,51 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
                       case maybeResolvedSource of
                         Nothing -> returnA -< Nothing
                         Just (sourceConfig, source) -> do
+                          -- If the run_sql per-schema path injected a fresh introspection
+                          -- (already fetched post-DDL — no DB re-query, see
+                          -- 'freshIntrospectionOverride'), use its tables/functions but KEEP
+                          -- this source's scalars and logical models. Because
+                          -- 'partitionIntrospectionBySchema' stamps the source-wide scalars and
+                          -- logical models into EVERY schema slice, reusing them keeps each
+                          -- UNCHANGED schema's slice byte-equal, so its per-schema
+                          -- 'buildTableCacheForSchema' stays an Inc cache hit (no cascade).
+                          -- Only the altered schema's slice differs and is rebuilt.
+                          overrideMeta <- bindA -< liftIO (HashMap.lookup sourceName <$> readIORef freshIntrospectionOverride)
+                          let resolvedSource = case overrideMeta >>= AB.unpackAnyBackend @b of
+                                Just fresh -> fresh {_rsScalars = _rsScalars source, _rsLogicalModels = _rsLogicalModels source}
+                                Nothing -> source
                           let metadataInvalidationKey = Inc.selectD #_ikMetadata invalidationKeys
                               (tableInputs, _, _) = unzip3 $ map mkTableInputs $ InsOrdHashMap.elems $ _smTables sourceMetadata
                               scNamingConvention = _scNamingConvention $ _smCustomization sourceMetadata
                               !namingConv = if isNamingConventionEnabled then fromMaybe defaultNC scNamingConvention else HasuraCase
-                          tablesCoreInfo <-
-                            buildTableCache
-                              -<
-                                ( sourceName,
-                                  sourceConfig,
-                                  _rsTables source,
-                                  tableInputs,
-                                  metadataInvalidationKey,
-                                  namingConv,
-                                  _smLogicalModels sourceMetadata
+                              -- Partition introspection and table inputs by schema so that
+                              -- buildTableCacheForSchema can be cached per schema.
+                              schemaMap = partitionIntrospectionBySchema @b resolvedSource
+                              sourceSchemaKeysDep = Inc.selectD #_ikSourceSchemas invalidationKeys
+                              tableInputsBySchema =
+                                HashMap.fromListWith (<>)
+                                  [ (tableNameSchema @b (_tbiName tbi), [tbi])
+                                  | tbi <- tableInputs
+                                  ]
+                          perSchemaCoreInfoMaps <-
+                            (|
+                              Inc.keyed
+                                ( \schemaName schemaIntrospection ->
+                                    buildTableCacheForSchema
+                                      -< ( sourceName,
+                                           sourceConfig,
+                                           schemaName,
+                                           schemaIntrospection,
+                                           fromMaybe [] (HashMap.lookup schemaName tableInputsBySchema),
+                                           Inc.selectKeyD (sourceName, schemaName) sourceSchemaKeysDep,
+                                           metadataInvalidationKey,
+                                           namingConv,
+                                           _smLogicalModels sourceMetadata
+                                         )
                                 )
+                              |)
+                              schemaMap
+                          let tablesCoreInfo = HashMap.unions $ HashMap.elems perSchemaCoreInfoMaps
 
                           let tablesMetadata = InsOrdHashMap.elems $ _smTables sourceMetadata
                               eventTriggers = map (_tmTable &&& InsOrdHashMap.elems . _tmEventTriggers) tablesMetadata
@@ -1301,7 +1764,7 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
                             -<
                               Just
                                 $ AB.mkAnyBackend @b
-                                $ PartiallyResolvedSource sourceMetadata sourceConfig source tablesCoreInfo eventTriggerInfoMaps
+                                $ PartiallyResolvedSource sourceMetadata sourceConfig resolvedSource tablesCoreInfo eventTriggerInfoMaps
                   )
                   -<
                     (exists, (dynamicConfig, invalidationKeys, storedIntrospection, defaultNC, isNamingConventionEnabled))
@@ -1325,21 +1788,49 @@ buildSchemaCacheRule logger env disableNativeQueryValidation mSchemaRegistryCont
                 AB.dispatchAnyBackendArrow @BackendMetadata @GetAggregationPredicatesDeps
                   ( proc
                       ( partiallyResolvedSource :: PartiallyResolvedSource b,
-                        (dynamicConfig, allResolvedSources, remoteSchemaCtxMap, orderedRoles)
+                        -- 'allResolvedSources' / 'remoteSchemaCtxMap' fed the old cross-source
+                        -- relationship pass in 'buildSource'; with decisions 1+3 there are none,
+                        -- so they are unused now that table resolution is per-schema (Phase 3).
+                        (dynamicConfig, _allResolvedSources, _remoteSchemaCtxMap, orderedRoles)
                         )
                     -> do
                       let PartiallyResolvedSource sourceMetadata sourceConfig introspection tablesInfo eventTriggers = partiallyResolvedSource
+                          DBObjectsIntrospection _dbTables dbFunctions _scalars introspectedLogicalModels = introspection
+                          sourceName = _smName sourceMetadata
+                          tablesMetadata = InsOrdHashMap.elems (_smTables sourceMetadata)
+                          (_, nonColumnInputs, permissions) = unzip3 $ map mkTableInputs tablesMetadata
+                          unifiedLogicalModelsHashMap =
+                            InsOrdHashMap.toHashMap (_smLogicalModels sourceMetadata <> introspectedLogicalModels)
+                          -- Phase 3 (§12): group this source's resolution inputs by DB schema so
+                          -- each schema's 'TableInfo's are built + cached independently. The
+                          -- grouping is cheap O(total) HashMap work; the expensive per-table
+                          -- resolution becomes O(changed schema) via 'buildTableInfosForSchema'.
+                          allSchemas = HashMap.fromList [(tableNameSchema @b tn, ()) | tn <- HashMap.keys tablesInfo]
+                          schemaBundles =
+                            flip HashMap.mapWithKey allSchemas $ \schemaName _ ->
+                              ( HashMap.filterWithKey (\tn _ -> tableNameSchema @b tn == schemaName) tablesInfo,
+                                filter (\nci -> tableNameSchema @b (_nctiTable nci) == schemaName) nonColumnInputs,
+                                filter (\tpi -> tableNameSchema @b (_tpiTable tpi) == schemaName) permissions,
+                                HashMap.filterWithKey (\tn _ -> tableNameSchema @b tn == schemaName) eventTriggers
+                              )
+                      perSchemaTableCaches <-
+                        (|
+                          Inc.keyed
+                            ( \_schemaName (tablesSlice, nonColSlice, permSlice, etSlice) ->
+                                buildTableInfosForSchema
+                                  -< (sourceName, sourceConfig, tablesSlice, nonColSlice, permSlice, etSlice, orderedRoles, unifiedLogicalModelsHashMap, dbFunctions)
+                            )
+                          |)
+                          schemaBundles
+                      let tableCache = HashMap.unions (HashMap.elems perSchemaTableCaches)
                       so <-
                         buildSource
                           -<
                             ( dynamicConfig,
-                              allResolvedSources,
                               sourceMetadata,
                               sourceConfig,
-                              tablesInfo,
-                              eventTriggers,
+                              tableCache,
                               introspection,
-                              remoteSchemaCtxMap,
                               orderedRoles
                             )
                       let scalarParsingContext = getter sourceConfig
@@ -1739,6 +2230,38 @@ buildRemoteSchemaRemoteRelationship allSources remoteSchemaMap remoteSchema remo
       buildRemoteFieldInfo (remoteSchemaToLHSIdentifier remoteSchema) allowedLHSJoinFields rr allSources remoteSchemaMap
     recordDependenciesM metadataObject schemaObj (lhsDependency Seq.:<| rhsDependencies)
     pure remoteField
+
+-- | Cache key for 'buildGQLContextCached': the full GQL/Relay context is
+-- rebuilt only when one of these changes.
+--
+--   * 'Metadata' value -- covers actions, custom types, remote schema
+--     definitions, and source/table tracking.
+--   * Per-(source, schema) 'Inc.InvalidationKey's actually used to build
+--     'mergedParsers' and the corresponding per-schema table caches in
+--     'SourceCache'.
+--   * Per-remote-schema 'Inc.InvalidationKey's -- covers remote schema
+--     introspection refresh.
+--   * The active role set.
+--   * The dynamic schema-build configuration.
+type GQLContextCacheKey =
+  ( Metadata,
+    -- Per (source, schema): the content fingerprint AND the invalidation key. The content
+    -- fingerprint is required so DB-introspection changes that don't move the invalidation keys
+    -- or 'Metadata' (e.g. 'run_sql' ALTER ADD COLUMN) still invalidate the cached GQL context.
+    HashMap SourceName (HashMap SchemaName (Value, Inc.InvalidationKey)),
+    HashMap RemoteSchemaName Inc.InvalidationKey,
+    [RoleName],
+    CacheDynamicConfig
+  )
+
+-- | Pairs a cache key @k@ with a payload @a@ whose 'Eq' instance (if any) is
+-- irrelevant to caching. The 'Eq' instance for 'KeyedBy' compares only the
+-- key, allowing 'Inc.cache' to be driven by @k@ even when @a@ contains values
+-- with no useful (or no) 'Eq' instance, such as 'SourceInfo b'.
+data KeyedBy k a = KeyedBy k a
+
+instance (Eq k) => Eq (KeyedBy k a) where
+  KeyedBy k1 _ == KeyedBy k2 _ = k1 == k2
 
 data BackendInfoAndSourceMetadata b = BackendInfoAndSourceMetadata
   { _bcasmBackendInfo :: BackendInfo b,

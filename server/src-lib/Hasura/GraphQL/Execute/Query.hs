@@ -4,7 +4,6 @@ module Hasura.GraphQL.Execute.Query
   )
 where
 
-import Data.Aeson qualified as J
 import Data.Environment qualified as Env
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashMap.Strict.InsOrd qualified as InsOrdHashMap
@@ -53,7 +52,7 @@ parseGraphQLQuery ::
   Options.NoNullUnboundVariableDefault ->
   GQLContext ->
   [G.VariableDefinition] ->
-  Maybe (HashMap G.Name J.Value) ->
+  Maybe GH.VariableValues ->
   [G.Directive G.Name] ->
   G.SelectionSet G.NoFragments G.Name ->
   m

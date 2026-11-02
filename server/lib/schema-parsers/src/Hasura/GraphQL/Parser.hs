@@ -58,6 +58,7 @@ module Hasura.GraphQL.Parser
     subselection_,
     jsonToGraphQL,
     valueToJSON,
+    valueToOrderedJSON,
     module Hasura.GraphQL.Parser.Class,
     module Hasura.GraphQL.Parser.ErrorCode,
     module Hasura.GraphQL.Parser.Monad,

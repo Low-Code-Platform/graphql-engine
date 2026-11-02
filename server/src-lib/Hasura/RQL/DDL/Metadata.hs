@@ -355,7 +355,8 @@ runReplaceMetadataV2' ReplaceMetadataV2 {..} = do
           { ciMetadata = False,
             ciRemoteSchemas = mempty,
             ciSources = HS.fromList $ InsOrdHashMap.keys newSources,
-            ciDataConnectors = mempty
+            ciDataConnectors = mempty,
+            ciSourceSchemas = mempty
           }
 
   -- put the new metadata in the state managed by the `MetadataT`
@@ -651,7 +652,8 @@ runReloadMetadata (ReloadMetadata reloadRemoteSchemas reloadSources reloadRecrea
           { ciMetadata = True,
             ciRemoteSchemas = remoteSchemaInvalidations,
             ciSources = sourcesInvalidations,
-            ciDataConnectors = dataConnectorInvalidations
+            ciDataConnectors = dataConnectorInvalidations,
+            ciSourceSchemas = mempty
           }
 
   buildSchemaCacheWithOptions (CatalogUpdate $ Just recreateEventTriggersSources) cacheInvalidations metadata Nothing

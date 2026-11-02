@@ -11,6 +11,7 @@ module Hasura.GraphQL.Schema.Remote
   )
 where
 
+import Data.Aeson.Ordered qualified as JO
 import Data.Has
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashMap.Strict.InsOrd qualified as InsOrdHashMap
@@ -380,7 +381,12 @@ remoteFieldScalarParser customizeTypename (G.ScalarTypeDefinition description na
       pParser = \case
         JSONValue v ->
           -- Disallow short-circuit optimisation if the type name has been changed by remote schema customization
-          pure $ (Altered $ G.getBaseType gType /= name, G.VVariable $ RemoteJSONValue (mkRemoteGType gType) v)
+          --
+            -- 'RemoteJSONValue' forwards the value to another GraphQL server, which
+            -- will parse it with its own JSON library; key order is not preserved
+            -- across that hop, so there is nothing to gain by keeping the ordered
+            -- representation here.
+          pure $ (Altered $ G.getBaseType gType /= name, G.VVariable $ RemoteJSONValue (mkRemoteGType gType) (JO.fromOrdered v))
         GraphQLValue v -> case v of
           G.VVariable var -> do
             P.typeCheck False gType var
@@ -491,7 +497,7 @@ shortCircuitIfUnaltered parser =
               -- The input value was already a JSON value: we still have to create
               -- a new JSON variable, but it will still be more efficient than having
               -- all the leaves of said value each be their own distinct value.
-              JSONValue v -> G.VVariable $ RemoteJSONValue (toGraphQLType $ P.pType parser) v
+              JSONValue v -> G.VVariable $ RemoteJSONValue (toGraphQLType $ P.pType parser) (JO.fromOrdered v)
           -- Otherwise either the parser did not yield any value, or a value
           -- that has been altered by presets, permissions or type name customization; we forward it
           -- unoptimized.

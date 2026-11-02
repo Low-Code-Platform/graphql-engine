@@ -14,6 +14,7 @@ where
 import Data.Aeson qualified as J
 import Data.Aeson.Key qualified as K
 import Data.Aeson.KeyMap qualified as KM
+import Data.Aeson.Ordered qualified as JO
 import Data.HashMap.Strict qualified as HashMap
 import Data.HashSet qualified as HashSet
 import Data.Text.Extended
@@ -120,15 +121,32 @@ maskGQLReqVariables maskedKeys (Protocol.GQLReq opName query vars) =
 maskVariableValues :: HashSet Text -> Protocol.VariableValues -> Protocol.VariableValues
 maskVariableValues maskedKeys = HashMap.mapWithKey maskIfSensitive
   where
-    maskIfSensitive :: G.Name -> J.Value -> J.Value
+    maskIfSensitive :: G.Name -> JO.Value -> JO.Value
     maskIfSensitive name val
-      | G.unName name `HashSet.member` maskedKeys = J.String "[MASKED]"
-      | otherwise = maskJsonValue maskedKeys val
+      | G.unName name `HashSet.member` maskedKeys = JO.String "[MASKED]"
+      | otherwise = maskOrderedJsonValue maskedKeys val
 
 -- | Mask sensitive keys in a 'GeneratedQuery''s prepared arguments.
 maskGeneratedQuery :: HashSet Text -> GeneratedQuery -> GeneratedQuery
 maskGeneratedQuery maskedKeys gq =
   gq {_gqPreparedArgs = maskJsonValue maskedKeys (_gqPreparedArgs gq)}
+
+-- | 'maskJsonValue' for the insertion-ordered values that variables are now
+-- carried as. Kept separate rather than round-tripping through aeson so that
+-- masking a variable does not also reorder its keys.
+maskOrderedJsonValue :: HashSet Text -> JO.Value -> JO.Value
+maskOrderedJsonValue maskedKeys = go
+  where
+    go (JO.Object obj) = JO.object $ map (second' maskKey) $ JO.toList obj
+    go (JO.Array arr) = JO.Array $ fmap go arr
+    go other = other
+
+    second' f (k, v) = (k, f k v)
+
+    maskKey :: Text -> JO.Value -> JO.Value
+    maskKey k v
+      | k `HashSet.member` maskedKeys = JO.String "[MASKED]"
+      | otherwise = go v
 
 -- | Recursively traverse a JSON 'Value', replacing the values of any object
 -- keys that match the masked set with "[MASKED]".

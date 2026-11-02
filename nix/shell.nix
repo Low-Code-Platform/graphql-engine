@@ -12,10 +12,10 @@ let
   # Unix ODBC Support
   freetdsWithODBC = pkgs.freetds.override {
     odbcSupport = true;
-    inherit unixODBC;
+    inherit (pkgs) unixodbc;
   };
 
-  msodbcsql = pkgs.unixODBCDrivers.msodbcsql18;
+  msodbcsql = pkgs.unixodbcDrivers.msodbcsql18;
 
   # Verify this works by running `odbcinst -q -d`.
   # The output should be the headings from the odbcinst.ini file.
@@ -31,7 +31,7 @@ let
     destination = "/odbcinst.ini";
   };
 
-  unixODBC = pkgs.unixODBC.overrideAttrs (oldAttrs: {
+  unixodbc = pkgs.unixodbc.overrideAttrs (oldAttrs: {
     configureFlags = (if oldAttrs ? configureFlags then oldAttrs.configureFlags else [ ]) ++ [ "--disable-gui" "--sysconfdir=${odbcConfiguration}" ];
   });
 
@@ -97,7 +97,6 @@ let
     hls
 
     pkgs.haskell.packages.${pkgs.ghcName}.alex
-    pkgs.haskell.packages.${pkgs.ghcName}.apply-refact
     (versions.ensureVersion pkgs.haskell.packages.${pkgs.ghcName}.cabal-install)
     (pkgs.haskell.lib.dontCheck (pkgs.haskell.packages.${pkgs.ghcName}.ghcid))
     pkgs.haskell.packages.${pkgs.ghcName}.happy
@@ -129,12 +128,13 @@ let
     pkgs.zlib
     pkgs.zstd
 
-    # PostgreSQL, Microsoft SQL Server, & MySQL dependencies.
+    # PostgreSQL, Microsoft SQL Server, MySQL, and LDAP dependencies.
     freetdsWithODBC
     pkgs.libmysqlclient
     pkgs.mariadb
+    pkgs.openldap
     pkgs.postgresql_16
-    unixODBC
+    unixodbc
     msodbcsql
   ]
   # Linux-specific libraries.

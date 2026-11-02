@@ -9,7 +9,7 @@ module Hasura.GraphQL.Parser.Internal.TypeChecking
   )
 where
 
-import Data.Aeson qualified as J
+import Data.Aeson.Ordered qualified as JO
 import Hasura.Base.ErrorMessage
 import Hasura.Base.ToErrorValue
 import Hasura.GraphQL.Parser.Class
@@ -130,12 +130,12 @@ describeValueWith describeVariable' = \case
   GraphQLValue gval -> describeGraphQL gval
   where
     describeJSON = \case
-      J.Null -> "null"
-      J.Bool _ -> "a boolean"
-      J.String _ -> "a string"
-      J.Number _ -> "a number"
-      J.Array _ -> "a list"
-      J.Object _ -> "an object"
+      JO.Null -> "null"
+      JO.Bool _ -> "a boolean"
+      JO.String _ -> "a string"
+      JO.Number _ -> "a number"
+      JO.Array _ -> "a list"
+      JO.Object _ -> "an object"
     describeGraphQL = \case
       VVariable var -> describeVariable' var
       VInt _ -> "an integer"

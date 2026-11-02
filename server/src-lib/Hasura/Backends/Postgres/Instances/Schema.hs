@@ -14,6 +14,7 @@ where
 
 import Data.Aeson qualified as J
 import Data.Aeson.Key qualified as K
+import Data.Aeson.Ordered qualified as JO
 import Data.Aeson.Types (JSONPathElement (..))
 import Data.Has
 import Data.HashMap.Strict.Extended qualified as HashMap
@@ -468,18 +469,33 @@ columnParser columnType nullability = case columnType of
       _ -> do
         name <- mkScalarTypeName tCase scalarType
         pure (name, P.TNamed P.NonNullable $ P.Definition name Nothing Nothing [] P.TIScalar)
+    orderedJsonInput <- retrieve Options.soOrderedJsonInput
     pure
       $ peelWithOrigin
       $ fmap (ColumnValue columnType)
       $ possiblyNullable scalarType nullability
       $ P.Parser
         { pType = schemaType,
-          pParser =
-            P.valueToJSON (P.toGraphQLType schemaType) >=> \case
-              J.Null -> P.parseError $ "unexpected null value for type " <> toErrorValue name
-              value ->
-                runAesonParser (parsePGValue scalarType) value
-                  `onLeft` (P.parseErrorWith P.ParseFailed . toErrorMessage . qeError)
+          pParser = case (scalarType, orderedJsonInput) of
+            -- A @json@ column stores its input document verbatim, so it is the
+            -- one scalar type for which the client's key order is observable
+            -- afterwards. Keep the ordered value and serialize it ourselves
+            -- rather than letting it round-trip through an aeson 'Value', whose
+            -- @KeyMap@ would sort the keys.
+            --
+            -- @jsonb@ is deliberately excluded: it decomposes into a binary form
+            -- that re-sorts keys regardless of what we send, so taking this path
+            -- for it would add cost and change nothing.
+            (PGJSON, Options.PreserveJsonInputOrder) ->
+              P.valueToOrderedJSON (P.toGraphQLType schemaType) >=> \case
+                JO.Null -> P.parseError $ "unexpected null value for type " <> toErrorValue name
+                value -> pure $ pgValJSONRawFromOrdered value
+            _ ->
+              P.valueToJSON (P.toGraphQLType schemaType) >=> \case
+                J.Null -> P.parseError $ "unexpected null value for type " <> toErrorValue name
+                value ->
+                  runAesonParser (parsePGValue scalarType) value
+                    `onLeft` (P.parseErrorWith P.ParseFailed . toErrorMessage . qeError)
         }
   ColumnEnumReference (EnumReference tableName enumValues tableCustomName) ->
     case nonEmpty . sortOn fst $ HashMap.toList enumValues of

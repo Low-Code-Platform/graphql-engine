@@ -17,6 +17,7 @@ module Hasura.RQL.DDL.Schema.Cache.Common
     ikRemoteSchemas,
     ikSources,
     ikBackends,
+    ikSourceSchemas,
     NonColumnTableInputs (..),
     RebuildableSchemaCache (RebuildableSchemaCache, lastBuiltSchemaCache),
     TableBuildInput (TableBuildInput, _tbiName),
@@ -58,6 +59,7 @@ import Hasura.LogicalModel.Types (LogicalModelLocation (..), LogicalModelName)
 import Hasura.Prelude
 import Hasura.RQL.DDL.Schema.Cache.Config
 import Hasura.RQL.DDL.SchemaRegistry (SchemaRegistryAction)
+import Hasura.Backends.Postgres.SQL.Types (SchemaName)
 import Hasura.RQL.Types.Backend
 import Hasura.RQL.Types.BackendType
 import Hasura.RQL.Types.Common
@@ -100,7 +102,9 @@ data InvalidationKeys = InvalidationKeys
   { _ikMetadata :: Inc.InvalidationKey,
     _ikRemoteSchemas :: HashMap RemoteSchemaName Inc.InvalidationKey,
     _ikSources :: HashMap SourceName Inc.InvalidationKey,
-    _ikBackends :: BackendMap BackendInvalidationKeysWrapper
+    _ikBackends :: BackendMap BackendInvalidationKeysWrapper,
+    -- | Per-(source, schema) invalidation keys for schema-scoped partial rebuilds.
+    _ikSourceSchemas :: HashMap (SourceName, SchemaName) Inc.InvalidationKey
   }
   deriving (Show, Eq, Generic)
 
@@ -109,7 +113,7 @@ instance Inc.Select InvalidationKeys
 $(makeLenses ''InvalidationKeys)
 
 initialInvalidationKeys :: InvalidationKeys
-initialInvalidationKeys = InvalidationKeys Inc.initialInvalidationKey mempty mempty mempty
+initialInvalidationKeys = InvalidationKeys Inc.initialInvalidationKey mempty mempty mempty mempty
 
 invalidateKeys :: CacheInvalidations -> InvalidationKeys -> InvalidationKeys
 invalidateKeys CacheInvalidations {..} InvalidationKeys {..} =
@@ -117,7 +121,13 @@ invalidateKeys CacheInvalidations {..} InvalidationKeys {..} =
     { _ikMetadata = if ciMetadata then Inc.invalidate _ikMetadata else _ikMetadata,
       _ikRemoteSchemas = foldl' (flip invalidate) _ikRemoteSchemas ciRemoteSchemas,
       _ikSources = foldl' (flip invalidate) _ikSources ciSources,
-      _ikBackends = BackendMap.modify @'DataConnector invalidateDataConnectors _ikBackends
+      _ikBackends = BackendMap.modify @'DataConnector invalidateDataConnectors _ikBackends,
+      _ikSourceSchemas =
+        -- Invalidate explicitly targeted (source, schema) pairs.
+        let afterExplicit = foldl' (flip invalidate) _ikSourceSchemas ciSourceSchemas
+         in -- Also invalidate all schema keys belonging to a fully-invalidated source,
+            -- so that ciSources and ciSourceSchemas stay consistent.
+            foldl' invalidateSourceSchemas afterExplicit ciSources
     }
   where
     invalidate ::
@@ -130,6 +140,15 @@ invalidateKeys CacheInvalidations {..} InvalidationKeys {..} =
     invalidateDataConnectors :: BackendInvalidationKeysWrapper 'DataConnector -> BackendInvalidationKeysWrapper 'DataConnector
     invalidateDataConnectors (BackendInvalidationKeysWrapper invalidationKeys) =
       BackendInvalidationKeysWrapper $ foldl' (flip invalidate) invalidationKeys ciDataConnectors
+
+    invalidateSourceSchemas ::
+      HashMap (SourceName, SchemaName) Inc.InvalidationKey ->
+      SourceName ->
+      HashMap (SourceName, SchemaName) Inc.InvalidationKey
+    invalidateSourceSchemas schemaKeys sourceName =
+      HashMap.mapWithKey
+        (\(sn, _) key -> if sn == sourceName then Inc.invalidate key else key)
+        schemaKeys
 
 data TableBuildInput b = TableBuildInput
   { _tbiName :: TableName b,

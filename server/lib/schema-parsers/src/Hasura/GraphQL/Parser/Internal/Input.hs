@@ -21,9 +21,8 @@ import Control.Applicative (Alternative ((<|>)))
 import Control.Arrow ((>>>))
 import Control.Lens hiding (enum, index)
 import Control.Monad (join, unless, (<=<), (>=>))
-import Data.Aeson qualified as J
 import Data.Aeson.Key qualified as K
-import Data.Aeson.KeyMap qualified as KM
+import Data.Aeson.Ordered qualified as JO
 import Data.Aeson.Types qualified as J
 import Data.Foldable (for_)
 import Data.HashMap.Strict (HashMap)
@@ -398,7 +397,7 @@ enum name description values =
     { pType = schemaType,
       pParser =
         peelVariable (toGraphQLType schemaType) >=> \case
-          JSONValue (J.String stringValue)
+          JSONValue (JO.String stringValue)
             | Just enumValue <- mkName stringValue -> validate enumValue
           GraphQLValue (VEnum (EnumValue enumValue)) -> validate enumValue
           other -> typeMismatch name "an enum value" other
@@ -438,9 +437,11 @@ object name description parser =
       pParser =
         peelVariable (toGraphQLType schemaType) >=> \case
           GraphQLValue (VObject fields) -> parseFields $ GraphQLValue <$> fields
-          JSONValue (J.Object fields) -> do
+          JSONValue (JO.Object fields) -> do
+            -- Each field's value stays an ordered 'JO.Value', so key order
+            -- survives destructuring down to the leaf column parsers.
             translatedFields <-
-              HashMap.fromList <$> for (KM.toList fields) \(K.toText -> key, val) -> do
+              HashMap.fromList <$> for (JO.toList fields) \(key, val) -> do
                 name' <- maybe (invalidName key) pure $ mkName key
                 pure (name', JSONValue val)
             parseFields translatedFields
@@ -474,7 +475,7 @@ list parser =
           peelVariable (toGraphQLType schemaType) >=> \case
             GraphQLValue (VList values) -> for (zip [0 ..] values) \(index, value) ->
               withKey (J.Index index) $ pParser parser $ GraphQLValue value
-            JSONValue (J.Array values) -> for (zip [0 ..] $ V.toList values) \(index, value) ->
+            JSONValue (JO.Array values) -> for (zip [0 ..] $ V.toList values) \(index, value) ->
               withKey (J.Index index) $ pParser parser $ JSONValue value
             -- List Input Coercion
             --
@@ -488,7 +489,7 @@ list parser =
             -- be returning `[null]` if the parser accepts a null value,
             -- which would contradict the spec.
             GraphQLValue VNull -> parseError "expected a list, but found null"
-            JSONValue J.Null -> parseError "expected a list, but found null"
+            JSONValue JO.Null -> parseError "expected a list, but found null"
             other -> fmap pure $ withKey (J.Index 0) $ pParser parser other
       }
   where

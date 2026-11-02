@@ -49,6 +49,8 @@ import Data.Functor (($>))
 import Data.HashMap.Strict.InsOrd (InsOrdHashMap)
 import Data.HashMap.Strict.InsOrd qualified as InsOrdHashMap
 import Data.Hashable (Hashable (..))
+import Data.List (sortOn)
+import Data.Ord (comparing)
 import Data.Scientific (Scientific)
 import Data.String (IsString)
 import Data.Text (Text)
@@ -56,6 +58,7 @@ import Data.Text qualified as T
 import Data.Vector (Vector)
 import Data.Vector qualified as V
 import GHC.Generics (Generic)
+import Language.Haskell.TH.Syntax qualified as TH
 
 --------------------------------------------------------------------------------
 -- Copied constants from aeson
@@ -84,6 +87,26 @@ import GHC.Generics (Generic)
 newtype Object = Object_ {unObject_ :: InsOrdHashMap Text Value}
   deriving stock (Data, Eq, Generic, Read, Show)
   deriving newtype (Hashable)
+
+-- | Both the derived 'Eq' and the newtype-derived 'Hashable' above are
+-- /order-insensitive/: @InsOrdHashMap@ compares and hashes only the underlying
+-- @HashMap k (P v)@, and @P@'s own instances discard the insertion index
+-- (@P _ a == P _ b = a == b@). So @{"a":1,"b":2}@ and @{"b":2,"a":1}@ remain
+-- equal and equal-hashing here even though 'toList' distinguishes them.
+--
+-- That is load-bearing, not incidental: these values key the query-plan cache
+-- and the subscription cohort map, so an order-sensitive 'Eq'/'Hashable' would
+-- silently stop otherwise-identical subscriptions from sharing a cohort.
+--
+-- 'Ord' must therefore agree with that 'Eq', which means comparing on the
+-- /key-sorted/ association list rather than on 'toList'. Comparing 'toList'
+-- directly would give @a == b@ while @compare a b /= EQ@, breaking any
+-- 'Data.Map' or 'Data.Set' keyed on a type containing an 'Object'.
+instance Ord Object where
+  compare = comparing (sortOn fst . InsOrdHashMap.toList . unObject_)
+
+instance TH.Lift Object where
+  liftTyped obj = [||fromList $$(TH.liftTyped (Data.Aeson.Ordered.toList obj))||]
 
 -- | Union the keys, ordered, in two maps, erroring on duplicates.
 safeUnion :: Object -> Object -> Either String Object
@@ -151,7 +174,18 @@ data Value
   | Number !Scientific
   | Bool !Bool
   | Null
-  deriving stock (Data, Eq, Generic, Read, Show)
+  deriving stock (Data, Eq, Generic, Ord, Read, Show)
+
+-- | Mirrors aeson's own @Lift Value@ instance. Arrays go via a list because
+-- 'Vector' has no 'TH.Lift' instance.
+instance TH.Lift Value where
+  liftTyped = \case
+    Object obj -> [||Object $$(TH.liftTyped obj)||]
+    Array arr -> [||Array (V.fromList $$(TH.liftTyped (V.toList arr)))||]
+    String text -> [||String $$(TH.liftTyped text)||]
+    Number number -> [||Number $$(TH.liftTyped number)||]
+    Bool boolean -> [||Bool $$(TH.liftTyped boolean)||]
+    Null -> [||Null||]
 
 instance Hashable Value where
   -- Lifted from Aeson's implementation for 'Value'.
@@ -172,6 +206,19 @@ instance AsNumber Value where
       downcast v = case v of
         Number n -> Right n
         _ -> Left v
+
+-- | Round-trips through aeson, and so is necessarily /order-lossy/: by the time
+-- 'parseJSON' is handed a 'J.Value' the key order of the source document is
+-- already gone. It exists so that types containing a 'Value' can keep deriving
+-- 'J.FromJSON' generically. To actually preserve order, decode the raw bytes
+-- with 'eitherDecode' instead.
+instance J.FromJSON Value where
+  parseJSON = pure . toOrdered
+
+-- | Encodes through aeson's 'J.Value', whose @KeyMap@ re-sorts object keys.
+-- Use 'Hasura.EncJSON.encJFromOrderedValue' where the output order matters.
+instance J.ToJSON Value where
+  toJSON = fromOrdered
 
 -- | Value pairs to Value
 object :: [(Text, Value)] -> Value

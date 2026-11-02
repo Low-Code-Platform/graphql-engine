@@ -72,8 +72,12 @@ package mysql
     /opt/homebrew/opt/mysql-client@5.7/lib
 
 package odbc
-  extra-include-dirs: /opt/homebrew/opt/unixodbc/include
-  extra-lib-dirs: /opt/homebrew/opt/unixodbc/lib
+  extra-include-dirs:
+    /opt/homebrew/opt/unixodbc/include
+    /usr/include
+  extra-lib-dirs:
+    /opt/homebrew/opt/unixodbc/lib
+    /usr/lib/x86_64-linux-gnu
 
 package pcre-light
   extra-include-dirs: /opt/homebrew/opt/pcre/include
@@ -83,15 +87,19 @@ package postgresql-libpq
   extra-include-dirs:
     /opt/homebrew/opt/libpq/include
     /opt/homebrew/opt/openssl/include
+    /usr/include/postgresql
   extra-lib-dirs:
     /opt/homebrew/opt/libpq/lib
     /opt/homebrew/opt/openssl/lib
+    /usr/lib/x86_64-linux-gnu
 
 package pg-client
   extra-include-dirs:
     /opt/homebrew/opt/libpq/include
     /opt/homebrew/opt/openssl/include
+    /usr/include/postgresql
   extra-lib-dirs:
     /opt/homebrew/opt/libpq/lib
     /opt/homebrew/opt/openssl/lib
+    /usr/lib/x86_64-linux-gnu
 

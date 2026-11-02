@@ -90,6 +90,7 @@ import Data.URL.Template qualified as Template
 import Database.PG.Query qualified as Query
 import Hasura.Authentication.Role (RoleName, adminRoleName)
 import Hasura.Backends.Postgres.Connection.MonadTx qualified as MonadTx
+import Hasura.Backends.Postgres.SQL.Types (SchemaName)
 import Hasura.Base.Error (IncludeInternalErrors (..))
 import Hasura.GraphQL.Execute.Subscription.Options qualified as Subscription.Options
 import Hasura.Logging qualified as Logging
@@ -341,7 +342,12 @@ data ServeOptionsRaw impl = ServeOptionsRaw
     rsoDisableNativeQueryValidation :: NativeQuery.Validation.DisableNativeQueryValidation,
     rsoPreserve401Errors :: Preserve401ErrorsStatus,
     rsoServerTimeout :: Maybe (Refined NonNegative Int),
-    rsoLogMaskedVariables :: Maybe (HashSet Text)
+    rsoLogMaskedVariables :: Maybe (HashSet Text),
+    -- | Default @(source, schema)@ pair used to select a per-pair GraphQL
+    -- context for header-less introspection requests (see
+    -- @per-schema-gql-context.md@ §4).
+    rsoDefaultSource :: Maybe Common.SourceName,
+    rsoDefaultSchema :: Maybe SchemaName
   }
 
 deriving stock instance (Show (Logging.EngineLogType impl)) => Show (ServeOptionsRaw impl)
@@ -671,7 +677,11 @@ data ServeOptions impl = ServeOptions
     soDisableNativeQueryValidation :: NativeQuery.Validation.DisableNativeQueryValidation,
     soPreserve401Errors :: Preserve401ErrorsStatus,
     soServerTimeout :: Refined NonNegative Int,
-    soLogMaskedVariables :: HashSet Text
+    soLogMaskedVariables :: HashSet Text,
+    -- | Default @(source, schema)@ used to select a per-pair GraphQL context for
+    -- header-less introspection requests (see @per-schema-gql-context.md@ §4).
+    soDefaultSource :: Maybe Common.SourceName,
+    soDefaultSchema :: Maybe SchemaName
   }
 
 -- | 'ResponseInternalErrorsConfig' represents the encoding of the

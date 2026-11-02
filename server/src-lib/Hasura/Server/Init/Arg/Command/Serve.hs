@@ -23,6 +23,8 @@ module Hasura.Server.Init.Arg.Command.Serve
     authHookSendRequestBodyOption,
     jwtSecretOption,
     unAuthRoleOption,
+    defaultSourceOption,
+    defaultSchemaOption,
     corsDomainOption,
     disableCorsOption,
     enableConsoleOption,
@@ -92,11 +94,13 @@ import Database.PG.Query qualified as Query
 import Hasura.Authentication.Role (RoleName)
 import Hasura.Authentication.Role qualified as Roles
 import Hasura.Backends.Postgres.Connection.MonadTx qualified as MonadTx
+import Hasura.Backends.Postgres.SQL.Types (SchemaName (..))
 import Hasura.Cache.Bounded qualified as Bounded
 import Hasura.GraphQL.Execute.Subscription.Options qualified as Subscription.Options
 import Hasura.Logging qualified as Logging
 import Hasura.NativeQuery.Validation qualified as NativeQuery
 import Hasura.Prelude
+import Hasura.RQL.Types.Common qualified as Common
 import Hasura.RQL.Types.Metadata (MetadataDefaults, emptyMetadataDefaults)
 import Hasura.RQL.Types.NamingCase qualified as NC
 import Hasura.RQL.Types.Schema.Options qualified as Options
@@ -181,6 +185,8 @@ serveCommandParser =
     <*> parsePreserve401Errors
     <*> parseServerTimeout
     <*> parseLogMaskedVariables
+    <*> parseDefaultSource
+    <*> parseDefaultSchema
 
 --------------------------------------------------------------------------------
 -- Serve Options
@@ -490,6 +496,46 @@ unAuthRoleOption =
       Config._helpMessage =
         "Unauthorized role, used when admin-secret is not sent in admin-secret only mode "
           ++ "or \"Authorization\" header is absent in JWT mode"
+    }
+
+parseDefaultSource :: Opt.Parser (Maybe Common.SourceName)
+parseDefaultSource =
+  Opt.optional
+    $ Opt.option
+      (Opt.eitherReader Env.fromEnv)
+      ( Opt.long "default-source"
+          <> Opt.metavar "<SOURCE>"
+          <> Opt.help (Config._helpMessage defaultSourceOption)
+      )
+
+defaultSourceOption :: Config.Option ()
+defaultSourceOption =
+  Config.Option
+    { Config._default = (),
+      Config._envVar = "HASURA_GRAPHQL_DEFAULT_SOURCE",
+      Config._helpMessage =
+        "Default source used to select the per-(source, schema) GraphQL context for "
+          ++ "header-less introspection requests (falls back to the first pair alphabetically)"
+    }
+
+parseDefaultSchema :: Opt.Parser (Maybe SchemaName)
+parseDefaultSchema =
+  Opt.optional
+    $ Opt.option
+      (Opt.eitherReader Env.fromEnv)
+      ( Opt.long "default-schema"
+          <> Opt.metavar "<SCHEMA>"
+          <> Opt.help (Config._helpMessage defaultSchemaOption)
+      )
+
+defaultSchemaOption :: Config.Option ()
+defaultSchemaOption =
+  Config.Option
+    { Config._default = (),
+      Config._envVar = "HASURA_GRAPHQL_DEFAULT_SCHEMA",
+      Config._helpMessage =
+        "Default DB schema used to select the per-(source, schema) GraphQL context for "
+          ++ "header-less introspection requests (falls back to the first pair alphabetically)"
     }
 
 parseCorsConfig :: Opt.Parser (Maybe Cors.CorsConfig)
@@ -1534,6 +1580,8 @@ serveCmdFooter =
         Config.optionPP authHookSendRequestBodyOption,
         Config.optionPP jwtSecretOption,
         Config.optionPP unAuthRoleOption,
+        Config.optionPP defaultSourceOption,
+        Config.optionPP defaultSchemaOption,
         Config.optionPP corsDomainOption,
         Config.optionPP disableCorsOption,
         Config.optionPP enableConsoleOption,

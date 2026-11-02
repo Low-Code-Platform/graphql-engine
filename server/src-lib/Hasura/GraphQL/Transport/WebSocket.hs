@@ -107,7 +107,7 @@ import Hasura.Server.Prometheus
     recordGraphqlOperationMetric,
   )
 import Hasura.Server.Telemetry.Counters qualified as Telem
-import Hasura.Server.Types (GranularPrometheusMetricsState (..), HeaderPrecedence, ModelInfoLogState (..), MonadGetPolicies (..), RemoteSchemaResponsePriority, RequestId, TraceQueryStatus (TraceQueryEnabled), getRequestId)
+import Hasura.Server.Types (ExperimentalFeature (..), GranularPrometheusMetricsState (..), HeaderPrecedence, ModelInfoLogState (..), MonadGetPolicies (..), RemoteSchemaResponsePriority, RequestId, TraceQueryStatus (TraceQueryEnabled), getRequestId)
 import Hasura.Services.Network
 import Hasura.Tracing qualified as Tracing
 import Language.GraphQL.Draft.Syntax (Name (..))
@@ -490,6 +490,7 @@ onStart enabledLogTypes agentLicenseKey serverEnv wsConn shouldCaptureVariables 
   sqlGenCtx <- liftIO $ acSQLGenCtx <$> getAppContext appStateRef
   enableAL <- liftIO $ acEnableAllowlist <$> getAppContext appStateRef
   remoteSchemaResponsePriority <- liftIO $ acRemoteSchemaResponsePriority <$> getAppContext appStateRef
+  defaultGqlSchema <- liftIO $ (\appCtx -> (acDefaultSource appCtx, acDefaultSchema appCtx)) <$> getAppContext appStateRef
 
   (reqParsed, queryParts) <- Tracing.newSpan "Parse GraphQL" Tracing.SKInternal $ do
     reqParsedE <- lift $ E.checkGQLExecution userInfo (reqHdrs, ipAddress) enableAL sc q requestId
@@ -529,6 +530,7 @@ onStart enabledLogTypes agentLicenseKey serverEnv wsConn shouldCaptureVariables 
         responseErrorsConfig
         headerPrecedence
         traceQueryStatus
+        defaultGqlSchema
 
   (parameterizedQueryHash, execPlan, modelInfoList) <- onLeft execPlanE (withComplete . preExecErr granularPrometheusMetricsState requestId (Just gqlOpType) opName Nothing)
 
@@ -1145,11 +1147,13 @@ onMessage enabledLogTypes authMode serverEnv wsConn msgRaw onMessageActions agen
             keepAliveMessageAction
         CMStart startMsg -> do
           schemaCache <- liftIO $ getSchemaCache $ _wseAppStateRef serverEnv
+          expFeatures <- liftIO $ acExperimentalFeatures <$> getAppContext (_wseAppStateRef serverEnv)
           let shouldCaptureVariables =
                 if _mcAnalyzeQueryVariables (scMetricsConfig schemaCache)
                   then CaptureQueryVariables
                   else DoNotCaptureQueryVariables
-          onStart enabledLogTypes agentLicenseKey serverEnv wsConn shouldCaptureVariables startMsg onMessageActions responseErrorsConfig headerPrecedence traceQueryStatus
+              startMsg' = withOrderedStartMsgVariables expFeatures msgRaw startMsg
+          onStart enabledLogTypes agentLicenseKey serverEnv wsConn shouldCaptureVariables startMsg' onMessageActions responseErrorsConfig headerPrecedence traceQueryStatus
         CMStop stopMsg -> do
           granularPrometheusMetricsState <- runGetPrometheusMetricsGranularity
           onStop serverEnv wsConn stopMsg granularPrometheusMetricsState
@@ -1162,6 +1166,23 @@ onMessage enabledLogTypes authMode serverEnv wsConn msgRaw onMessageActions agen
     logger = _wseLogger serverEnv
     onErrAction = WS._wsaOnErrorMessageAction onMessageActions
     keepAliveMessageAction = WS._wsaKeepAliveAction onMessageActions
+
+-- | Restore the key order of variable values in a @start@ \/ @subscribe@ message
+-- unless 'EFDisableOrderedJsonInput' is set.
+--
+-- The websocket counterpart of
+-- 'Hasura.Server.App.parseBodyWithOrderedVariables': the message has already
+-- been decoded by aeson (so key order is gone), and we re-parse the same frame
+-- with an order-preserving decoder to recover it. The variables live under the
+-- message's @payload@ object rather than at the top level, which is the only
+-- difference from the HTTP path.
+withOrderedStartMsgVariables :: Set.HashSet ExperimentalFeature -> LBS.ByteString -> StartMsg -> StartMsg
+withOrderedStartMsgVariables expFeatures msgRaw startMsg@(StartMsg opId reqUnparsed)
+  | not (EFDisableOrderedJsonInput `Set.member` expFeatures),
+    Right (JO.Object msgObj) <- JO.eitherDecode msgRaw,
+    Just payload <- JO.lookup "payload" msgObj =
+      StartMsg opId (withOrderedVariables payload reqUnparsed)
+  | otherwise = startMsg
 
 onPing :: (MonadIO m) => WSConn -> Maybe PingPongPayload -> m ()
 onPing wsConn mPayload =

@@ -57,6 +57,7 @@ import Database.PG.Query qualified as PG
 import Hasura.Authentication.User (UserInfoM (..))
 import Hasura.Backends.DataConnector.Adapter.Types (DataConnectorName)
 import Hasura.Backends.Postgres.Connection
+import Hasura.Backends.Postgres.SQL.Types (SchemaName)
 import Hasura.Base.Error
 import Hasura.EncJSON
 import Hasura.GraphQL.Analyse
@@ -223,7 +224,10 @@ data CacheInvalidations = CacheInvalidations
     -- by the @pg_reload_source@ API.
     ciSources :: HashSet SourceName,
     -- | Force re-fetching of `DataConnectorInfo` from the named data connectors.
-    ciDataConnectors :: HashSet DataConnectorName
+    ciDataConnectors :: HashSet DataConnectorName,
+    -- | Force rebuilding of the cache for the given (source, schema) pairs only, without
+    -- invalidating other schemas in the same source.
+    ciSourceSchemas :: HashSet (SourceName, SchemaName)
   }
   deriving stock (Generic)
 
@@ -235,11 +239,11 @@ instance ToJSON CacheInvalidations where
   toEncoding = genericToEncoding hasuraJSON
 
 instance Semigroup CacheInvalidations where
-  CacheInvalidations a1 b1 c1 d1 <> CacheInvalidations a2 b2 c2 d2 =
-    CacheInvalidations (a1 || a2) (b1 <> b2) (c1 <> c2) (d1 <> d2)
+  CacheInvalidations a1 b1 c1 d1 e1 <> CacheInvalidations a2 b2 c2 d2 e2 =
+    CacheInvalidations (a1 || a2) (b1 <> b2) (c1 <> c2) (d1 <> d2) (e1 <> e2)
 
 instance Monoid CacheInvalidations where
-  mempty = CacheInvalidations False mempty mempty mempty
+  mempty = CacheInvalidations False mempty mempty mempty mempty
 
 -- | Function that validates the new schema cache (usually involves checking for any metadata inconsistencies)
 -- and can decide whether or not to keep or discard the new schema cache ('ValidateNewSchemaCacheResult'). It

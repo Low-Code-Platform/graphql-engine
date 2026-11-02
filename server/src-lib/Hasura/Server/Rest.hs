@@ -5,8 +5,7 @@ module Hasura.Server.Rest
 where
 
 import Control.Monad.Trans.Control (MonadBaseControl)
-import Data.Aeson
-import Data.Aeson qualified as J
+import Data.Aeson.Ordered qualified as JO
 import Data.Align qualified as Align
 import Data.Environment qualified as Env
 import Data.HashMap.Strict.Extended qualified as HashMap
@@ -17,6 +16,7 @@ import Data.These (These (..))
 import Hasura.Authentication.User (UserInfo)
 import Hasura.Backends.DataConnector.Agent.Client (AgentLicenseKey)
 import Hasura.Base.Error
+import Hasura.Backends.Postgres.SQL.Types (SchemaName)
 import Hasura.CredentialCache
 import Hasura.EncJSON
 import Hasura.GraphQL.Execute qualified as E
@@ -53,7 +53,7 @@ parseVariableNames queryx =
 
 -- Given a list of expected variables and the parsed vars from the path,
 -- return a map of variable names to `These expected parsed`.
-alignVars :: [G.VariableDefinition] -> [(Text, Either Text Value)] -> HashMap G.Name (These G.VariableDefinition (Either Text Value))
+alignVars :: [G.VariableDefinition] -> [(Text, Either Text JO.Value)] -> HashMap G.Name (These G.VariableDefinition (Either Text JO.Value))
 alignVars defVars parseVars =
   Align.align
     (HashMap.fromList (map (\v -> (G._vdName v, v)) defVars))
@@ -62,7 +62,7 @@ alignVars defVars parseVars =
 -- | `resolveVar` is responsible for decoding variables sent via REST request.
 -- These can either be via body (represented by Right) or via query-param or URL param (represented by Left).
 -- A variable can be expected, unexpected, or missing (represented by These, This, and That).
-resolveVar :: G.Name -> These G.VariableDefinition (Either Text J.Value) -> Either Text (Maybe Value)
+resolveVar :: G.Name -> These G.VariableDefinition (Either Text JO.Value) -> Either Text (Maybe JO.Value)
 resolveVar _ (This _expectedVar) = Right Nothing -- If a variable is expected but missing, assign a missing value `Nothing` to it for resolution in query execution. This allows Null defaulting.
 resolveVar varName (That _providedVar) = Left $ "Unexpected variable " <> toTxt @G.Name varName -- If a variable is unexpected but present, throw an error.
 resolveVar _varName (These _expectedVar (Right bodyVar)) = Right (Just bodyVar) -- Variables sent via body can be passed through to execution without parsing.
@@ -70,12 +70,12 @@ resolveVar varName (These expectedVar (Left l)) =
   case G._vdType expectedVar of
     G.TypeList _ _ -> Left $ "List variables are not currently supported in URL or Query parameters. (Variable " <> toTxt @G.Name varName <> ", with value " <> tshow l <> ")"
     G.TypeNamed (G.Nullability nullable) typeName
-      | typeName == GName._Boolean && T.null l -> Right $ Just $ J.Bool True -- Booleans indicated true by a standalone key.
+      | typeName == GName._Boolean && T.null l -> Right $ Just $ JO.Bool True -- Booleans indicated true by a standalone key.
       | nullable && T.null l -> Right Nothing -- Missing value, but nullable variable sets value to null.
-      | otherwise -> case J.decodeStrict (T.encodeUtf8 l) of -- We special case parsing of bools and numbers and pass the rest through as literal strings.
-          Just v@(J.Bool _) | typeName `elem` [Name._Bool, GName._Boolean] -> Right $ Just v
-          Just v@(J.Number _) | typeName `elem` [GName._Int, GName._Float, Name._Number, Name._Double, Name._float8, Name._numeric] -> Right $ Just v
-          _ -> Right $ Just $ J.String l
+      | otherwise -> case JO.decode (T.encodeUtf8 l) of -- We special case parsing of bools and numbers and pass the rest through as literal strings.
+          Just v@(JO.Bool _) | typeName `elem` [Name._Bool, GName._Boolean] -> Right $ Just v
+          Just v@(JO.Number _) | typeName `elem` [GName._Int, GName._Float, Name._Number, Name._Double, Name._float8, Name._numeric] -> Right $ Just v
+          _ -> Right $ Just $ JO.String l
 
 mkPassthroughRequest :: EndpointMetadata GQLQueryWithText -> VariableValues -> GQLReq GQLQueryText
 mkPassthroughRequest queryx resolvedVariables =
@@ -90,7 +90,7 @@ data RestRequest method = RestRequest
     reqMethod :: method, -- EndpointMethod
 
     -- | URL Query/Request Body Arguments
-    reqArgs :: [(Text, Either Text J.Value)]
+    reqArgs :: [(Text, Either Text JO.Value)]
   }
   deriving (Functor, Foldable, Traversable)
 
@@ -131,8 +131,10 @@ runCustomEndpoint ::
   RestRequest EndpointMethod ->
   EndpointTrie GQLQueryWithText ->
   Init.ResponseInternalErrorsConfig ->
+  -- | Configured @(default source, default schema)@ from the serve options.
+  (Maybe SourceName, Maybe SchemaName) ->
   m (HttpLogGraphQLInfo, HttpResponse EncJSON)
-runCustomEndpoint env sqlGenCtx sc enableAL readOnlyMode remoteSchemaResponsePriority headerPrecedence traceQueryStatus prometheusMetrics logger agentLicenseKey requestId userInfo reqHeaders ipAddress RestRequest {..} endpoints responseErrorsConfig = do
+runCustomEndpoint env sqlGenCtx sc enableAL readOnlyMode remoteSchemaResponsePriority headerPrecedence traceQueryStatus prometheusMetrics logger agentLicenseKey requestId userInfo reqHeaders ipAddress RestRequest {..} endpoints responseErrorsConfig defaultGqlSchema = do
   -- First match the path to an endpoint.
   case matchPath reqMethod (T.split (== '/') reqPath) endpoints of
     MatchFound (queryx :: EndpointMetadata GQLQueryWithText) matches ->
@@ -162,7 +164,7 @@ runCustomEndpoint env sqlGenCtx sc enableAL readOnlyMode remoteSchemaResponsePri
               -- with the query string from the schema cache, and pass it
               -- through to the /v1/graphql endpoint.
               (httpLoggingMetadata, handlerResp) <- do
-                (gqlOperationLog, resp) <- GH.runGQ env sqlGenCtx sc enableAL readOnlyMode remoteSchemaResponsePriority headerPrecedence traceQueryStatus prometheusMetrics logger agentLicenseKey requestId userInfo ipAddress reqHeaders E.QueryHasura (mkPassthroughRequest queryx resolvedVariables) responseErrorsConfig
+                (gqlOperationLog, resp) <- GH.runGQ env sqlGenCtx sc enableAL readOnlyMode remoteSchemaResponsePriority headerPrecedence traceQueryStatus prometheusMetrics logger agentLicenseKey requestId userInfo ipAddress reqHeaders E.QueryHasura (mkPassthroughRequest queryx resolvedVariables) responseErrorsConfig defaultGqlSchema
                 let httpLoggingGQInfo = (CommonHttpLogMetadata RequestModeNonBatchable Nothing, (PQHSetSingleton (gqolParameterizedQueryHash gqlOperationLog)))
                 return (httpLoggingGQInfo, fst <$> resp)
               case sequence handlerResp of

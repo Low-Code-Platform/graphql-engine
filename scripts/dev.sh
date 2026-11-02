@@ -82,7 +82,7 @@ exit 1
 }
 
 # See: TODO
-cabal --version | grep -q -E ' 3\.10|3\.12' || { 
+cabal --version | grep -q -E ' 3\.(10|1[0-9])' || { 
     echo_error "Please use cabal >=3.10, as cabal broke 'import' and we can't make it compatible"
     exit 1
 }
@@ -274,6 +274,13 @@ MODE="$1"
 
 PROJECT_ROOT="$( cd "$( dirname "${BASH_SOURCE[0]}" )/.." >/dev/null 2>&1 && pwd )"   # ... https://stackoverflow.com/a/246128/176841
 cd "$PROJECT_ROOT"
+
+# Add PostgreSQL bin to PATH so pg_config is available for postgresql-libpq build
+if [ -d "/usr/lib/postgresql/18/bin" ]; then
+  export PATH="/usr/lib/postgresql/18/bin:$PATH"
+elif [ -d "/usr/lib/postgresql/16/bin" ]; then
+  export PATH="/usr/lib/postgresql/16/bin:$PATH"
+fi
 
 # In CI we use the get version script to actually populate the version number
 # that will be compiled into the server. For local development we use this

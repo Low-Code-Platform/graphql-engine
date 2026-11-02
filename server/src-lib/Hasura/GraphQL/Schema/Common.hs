@@ -283,7 +283,10 @@ calling monad with a simple `lift`, as demonstrated in
 --
 -- In the future, we might monomorphize this further to make `MemoizeT` explicit.
 newtype SchemaT r m a = SchemaT {runSchemaT :: ReaderT r m a}
-  deriving newtype (Functor, Applicative, Monad, MonadReader r, P.MonadMemoize, MonadTrans, MonadError e)
+  -- MonadIO is exposed for the Phase 9 per-table field cache, which must consult a
+  -- store from inside the builders. The base monad already needs MonadIO for
+  -- memoization (see Note [MemoizeT requires MonadIO]); this only surfaces it.
+  deriving newtype (Functor, Applicative, Monad, MonadReader r, P.MonadMemoize, MonadTrans, MonadError e, MonadIO)
 
 instance (Has SchemaContext r, Monad m) => FF.HasFeatureFlagChecker (SchemaT r m) where
   checkFlag ff = do

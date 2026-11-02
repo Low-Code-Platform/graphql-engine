@@ -828,8 +828,15 @@ instance MonadMetadataStorage AppM where
 
   updateMetadataAndNotifySchemaSync instanceId resourceVersion metadata cacheInvalidations =
     runInSeparateTx $ do
-      newResourceVersion <- setMetadataInCatalog resourceVersion metadata
-      notifySchemaCacheSyncTx newResourceVersion instanceId cacheInvalidations
+      -- The diff write reports which @(source, schema)@ partitions actually
+      -- changed; fold them into 'ciSourceSchemas' so other instances invalidate
+      -- only those partitions' schema-cache nodes (Phase 2, §11.3).
+      (newResourceVersion, changedPairs) <- setMetadataInCatalog resourceVersion metadata
+      let cacheInvalidations' =
+            cacheInvalidations
+              { ciSourceSchemas = ciSourceSchemas cacheInvalidations <> changedPairs
+              }
+      notifySchemaCacheSyncTx newResourceVersion instanceId cacheInvalidations'
       pure newResourceVersion
 
   -- stored source introspection is not available in this distribution

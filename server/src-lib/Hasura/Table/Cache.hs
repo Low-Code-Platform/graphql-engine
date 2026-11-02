@@ -1032,6 +1032,11 @@ instance (Backend b) => FromJSON (ForeignKey b) where
 -- information is accumulated. See also 'TableCoreInfo'.
 data TableCoreInfoG (b :: BackendType) field primaryKeyColumn = TableCoreInfo
   { _tciName :: TableName b,
+    -- | The database object identifier (e.g. Postgres @pg_class.oid@) of the
+    -- table, captured at introspection time. Stable across renames, so it lets
+    -- a subsequent DDL diff reconstruct the pre-DDL table snapshot from this
+    -- cache instead of re-introspecting the database.
+    _tciOid :: OID,
     _tciDescription :: Maybe Postgres.PGDescription, -- TODO make into type family?
     _tciFieldInfoMap :: FieldInfoMap field,
     _tciPrimaryKey :: Maybe (PrimaryKey b primaryKeyColumn),

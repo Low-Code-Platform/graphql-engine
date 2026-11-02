@@ -25,6 +25,7 @@ import Data.Text.Encoding qualified as Text.Encoding
 import Database.PG.Query qualified as Query
 import Hasura.Logging qualified as Logging
 import Hasura.Prelude
+import Hasura.Backends.Postgres.SQL.Types (getSchemaTxt)
 import Hasura.RQL.Types.Schema.Options qualified as Options
 import Hasura.Server.Auth qualified as Auth
 import Hasura.Server.Init.Config qualified as Config
@@ -96,6 +97,8 @@ serveOptsToLog so =
           "auth_hook_mode" .= (show . Auth.ahType <$> Config.soAuthHook so),
           "jwt_secret" .= (J.toJSON <$> Config.soJwtSecret so),
           "unauth_role" .= Config.soUnAuthRole so,
+          "default_source" .= Config.soDefaultSource so,
+          "default_schema" .= (getSchemaTxt <$> Config.soDefaultSchema so),
           "cors_config" .= Config.soCorsConfig so,
           "enable_console" .= Config.soConsoleStatus so,
           "console_assets_dir" .= Config.soConsoleAssetsDir so,

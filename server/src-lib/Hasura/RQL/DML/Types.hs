@@ -10,6 +10,7 @@ module Hasura.RQL.DML.Types
     SelectQuery,
     SelectQueryT,
     InsObj,
+    withOrderedInsertObjects,
     InsertQuery (..),
     OnConflict (..),
     ConflictAction (..),
@@ -29,6 +30,7 @@ import Data.HashMap.Strict qualified as HashMap
 import Hasura.Backends.Postgres.Instances.Types ()
 import Hasura.Backends.Postgres.SQL.DML qualified as Postgres
 import Hasura.Backends.Postgres.SQL.Types
+import Data.Aeson.Ordered qualified as JO
 import Hasura.Prelude
 import Hasura.RQL.IR.BoolExp
 import Hasura.RQL.IR.OrderBy
@@ -149,7 +151,11 @@ type SelectQuery = DMLQuery SelectQ
 
 type SelectQueryT = DMLQuery SelectQT
 
-type InsObj b = ColumnValues b Value
+-- | Insert values carry an insertion-ordered 'JO.Value' rather than an aeson
+-- 'Value', so that the key order a client sent survives into a Postgres
+-- @json@ column. Only inserts do this; every other DML operation still uses
+-- aeson, whose @KeyMap@ sorts object keys.
+type InsObj b = ColumnValues b JO.Value
 
 data ConflictAction
   = CAIgnore
@@ -183,10 +189,31 @@ data OnConflict = OnConflict
 instance FromJSON OnConflict where
   parseJSON = genericParseJSON hasuraJSON {omitNothingFields = True}
 
+-- | Replace an insert's @objects@ with the order-preserving value taken from an
+-- ordered parse of the same request body.
+--
+-- The RQL query API decodes its body with aeson, which sorts object keys, so by
+-- the time 'InsertQuery' exists the key order the client sent is gone. Rather
+-- than hand-roll a second decoder for the whole RQL surface, the body is parsed
+-- a second time with the order-preserving decoder and only @objects@ is taken
+-- from it — the same approach
+-- 'Hasura.GraphQL.Transport.HTTP.Protocol.withOrderedVariables' takes for
+-- GraphQL variables.
+--
+-- A body that does not have the expected @args.objects@ shape leaves the query
+-- untouched, so this can never turn a working request into a failing one.
+withOrderedInsertObjects :: JO.Value -> InsertQuery -> InsertQuery
+withOrderedInsertObjects bodyVal q = case bodyVal of
+  JO.Object body
+    | Just (JO.Object args) <- JO.lookup "args" body,
+      Just objs <- JO.lookup "objects" args ->
+        q {iqObjects = objs}
+  _ -> q
+
 data InsertQuery = InsertQuery
   { iqTable :: QualifiedTable,
     iqSource :: SourceName,
-    iqObjects :: Value,
+    iqObjects :: JO.Value,
     iqOnConflict :: Maybe OnConflict,
     iqReturning :: Maybe [PGCol]
   }

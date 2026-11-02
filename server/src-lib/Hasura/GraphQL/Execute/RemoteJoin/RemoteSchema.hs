@@ -268,9 +268,9 @@ fieldsToRequest gFields =
           }
     }
   where
-    variableInfos :: HashMap G.VariableDefinition J.Value
+    variableInfos :: HashMap G.VariableDefinition AO.Value
     variableInfos = HashMap.fromList $ concatMap (foldMap getVariableInfo) gFields
-    getVariableInfo :: P.Variable -> [(G.VariableDefinition, J.Value)]
+    getVariableInfo :: P.Variable -> [(G.VariableDefinition, AO.Value)]
     getVariableInfo = pure . fmap snd . getVariableDefinitionAndValue
 
 ------------------------------------------------------------------------------
